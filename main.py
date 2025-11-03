@@ -7,7 +7,7 @@ import httpx
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.1")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,11 +39,9 @@ def get_env() -> Dict[str, str]:
     }
 
 def ado_headers(pat: str) -> Dict[str, str]:
-    # Azure DevOps requires a non-empty username for PAT-based auth
     basic = base64.b64encode(f"pat:{pat}".encode()).decode()
     return {
         "Authorization": f"Basic {basic}",
-        # Prevent browser-style redirects to Microsoft login pages
         "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
         "User-Agent": "ado-git-crawler/1.0",
@@ -61,14 +59,20 @@ async def health():
     return {"status": "ok"}
 
 # ------------------------------------------------------------
-# FETCH FILE CONTENT FROM ADO
+# FETCH FILE CONTENT FROM ADO (includes HEAD→default fix)
 # ------------------------------------------------------------
 async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     env = get_env()
     base = ado_base(env)
+
+    # 🩹 Normalize HEAD → env default (avoids 404s)
+    used_ref = ref or env["REF"]
+    if str(used_ref).upper() == "HEAD":
+        used_ref = env["REF"]
+
     params = {
         "path": f"/{path}" if not path.startswith("/") else path,
-        "versionDescriptor.version": ref or env["REF"],
+        "versionDescriptor.version": used_ref,
         "includeContent": "true",
         "api-version": env["API"],
     }
@@ -82,7 +86,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
             raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
 
         if r.status_code == 404:
-            raise HTTPException(404, f"File not found in ADO: {path}@{ref or env['REF']}")
+            raise HTTPException(404, f"File not found in ADO: {path}@{used_ref}")
 
         try:
             r.raise_for_status()
@@ -98,7 +102,6 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         if not content:
             raise HTTPException(404, "No content found for this path (might be binary or empty).")
 
-        # Try to base64-decode if needed
         try:
             content = base64.b64decode(content).decode("utf-8")
         except Exception:
@@ -107,7 +110,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         return {
             "content": content,
             "sha": data.get("objectId") or data.get("commitId") or "unknown",
-            "ref": ref or env["REF"],
+            "ref": used_ref,
         }
 
 # ------------------------------------------------------------
