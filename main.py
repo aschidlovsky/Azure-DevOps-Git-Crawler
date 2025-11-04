@@ -1,5 +1,5 @@
 import os, base64, re, json, logging, asyncio, time
-from typing import Dict, Any, List, Set, Optional
+from typing import Dict, Any, List, Set, Optional, Tuple
 from contextlib import asynccontextmanager
 
 import httpx
@@ -11,7 +11,7 @@ from asyncio import Semaphore
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.5.0")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,7 +49,7 @@ def ado_headers(pat: str) -> Dict[str, str]:
         "Authorization": f"Basic {basic}",
         "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
-        "User-Agent": "ado-git-crawler/1.5",
+        "User-Agent": "ado-git-crawler/1.6",
     }
 
 def ado_base(env: Dict[str, str]) -> str:
@@ -141,7 +141,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 # LIGHTWEIGHT PARSER (kernel/system filter + Form DS implicit CRUD)
 # ------------------------------------------------------------
 DEPENDENCY_PATTERNS = [
-    # prefer table refs via from/join to avoid EDT/field names
+    # Prefer table refs via from/join to avoid EDT/field names
     (r"\b(from|join)\s+([A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})\b", "Table", "from-join"),
     (r"\b(\w+)\.DataSource\(", "Table", "DataSource()"),
     (r"\b(\w+)::(construct|new|run)\b", "Class", "static-call"),
@@ -213,15 +213,13 @@ def is_valid_symbol(symbol: str) -> bool:
     low = s.lower()
     if low in KERNEL_SKIP or low in EXTRA_SKIP:
         return False
-    # hard block framework/utility prefixes
     if any(s.startswith(p) for p in FRAMEWORK_PREFIXES):
         return False
-    # Reject ALL-UPPERCASE tokens (filters ENDPROPERTIES, SMD, etc.)
-    if s.isupper():
+    if s.isupper():  # filters ENDPROPERTIES, SMD, etc.
         return False
     return bool(ALLOWED_SYMBOL.match(s))
 
-# ---------- variable → type binding (resolve purchTable → PurchTable) ----------
+# ---------- variable → type binding ----------
 DECLARATION_SIG = re.compile(
     r"\b([A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})\s+([a-z][A-Za-z0-9_]*)\s*;", re.MULTILINE
 )
@@ -242,12 +240,6 @@ DS_BLOCK = re.compile(
 )
 
 def _parse_form_datasources(content: str) -> List[Dict[str, Optional[str]]]:
-    """
-    Extract DataSource 'Table' and permission flags from a Form XPO.
-    Returns a list of dicts: {table, allow_create, allow_delete, allow_edit} with values:
-      - table: 'mssBDAckTable' (string) or None
-      - flags: True / False / None (None = unspecified)
-    """
     results: List[Dict[str, Optional[str]]] = []
     for m in DS_BLOCK.finditer(content):
         props = m.group(1)
@@ -336,10 +328,10 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     # Form DS → dependency on the DS Table + CRUD methods gated by Allow* flags
     is_form = _looks_like_form_path(file_path or "")
     if is_form:
-        # 1) Prefer explicit PROPERTIES parsing for authoritative DS config
+        # Prefer explicit PROPERTIES parsing
         ds_list = _parse_form_datasources(content)
 
-        # 2) Fallback: legacy patterns (kept for compatibility)
+        # Fallback: legacy patterns (kept for compatibility)
         if not ds_list:
             legacy_ds: Set[str] = set()
             for p in FORM_DS_PATTERNS:
@@ -371,13 +363,10 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             allow_edit   = ds.get("allow_edit")
 
             methods: List[str] = []
-            # Edit controls UPDATE (+ validateWrite + write)
             if allow_edit is not False:
                 methods.extend(["update()", "validateWrite()", "write()"])
-            # Create controls INSERT
             if allow_create is not False:
                 methods.append("insert()")
-            # Delete controls DELETE (+ validateDelete)
             if allow_delete is not False:
                 methods.extend(["delete()", "validateDelete()"])
 
@@ -414,10 +403,8 @@ def _should_skip_dep_path(p: str) -> bool:
     folder, symbol = m.group(1), m.group(2)
     if folder not in ALLOWED_FOLDERS:
         return True
-    # block framework/utility prefixes at path level too
     if any(symbol.startswith(pref) for pref in FRAMEWORK_PREFIXES):
         return True
-    # enforce valid AX-like symbol form
     if not is_valid_symbol(symbol):
         return True
     if symbol in KERNEL_SKIP:
@@ -427,7 +414,7 @@ def _should_skip_dep_path(p: str) -> bool:
         "exists","update_recordset","delete_from","insert_recordset","this","super"
     }:
         return True
-    if symbol.isupper():  # extra guard to block tokens like ENDPROPERTIES, SMD
+    if symbol.isupper():
         return True
     if len(symbol) < 3:
         return True
@@ -436,15 +423,52 @@ def _should_skip_dep_path(p: str) -> bool:
 def _normalize_dep_path(p: str) -> str:
     """
     Strip 'lcl' or 'Lcl' prefix (including 'lclmss') while preserving 'mss'.
-    Examples:
-      Tables/lclPurchLine.xpo   -> Tables/PurchLine.xpo
-      Tables/lclmssBDAck.xpo    -> Tables/mssBDAck.xpo
     """
     return re.sub(
         r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
         lambda m: f"{m.group(1)}{(m.group(3) or '')}{m.group(4)}",
         p or "",
     )
+
+# ---------- FOLDER FALLBACKS (retry on 404/misclassification) ----------
+def _alt_folders_for(folder: str) -> List[str]:
+    order = ["Tables", "Classes", "Forms", "Maps"]
+    return [f for f in order if f != folder]
+
+def _split_folder_symbol(path: str) -> Tuple[Optional[str], Optional[str]]:
+    m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", path or "")
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+async def _resolve_existing_path_with_fallbacks(path: str, ref: Optional[str]) -> Tuple[str, Optional[str]]:
+    """
+    Try the given path; if 404, attempt same symbol in other folders.
+    Returns (resolved_path, corrected_from) where corrected_from is the original
+    path if a fallback succeeded, else None.
+    """
+    try:
+        await get_item_content(path, ref)
+        return path, None
+    except HTTPException as e:
+        if e.status_code != 404:
+            raise
+        folder, symbol = _split_folder_symbol(path)
+        if not folder or not symbol:
+            raise
+        for alt in _alt_folders_for(folder):
+            candidate = f"{alt}/{symbol}.xpo"
+            try:
+                await get_item_content(candidate, ref)
+                log.info(f"[fallback] {path} -> {candidate}")
+                return candidate, path
+            except HTTPException as ee:
+                if ee.status_code == 404:
+                    continue
+                else:
+                    raise
+        # not found anywhere → propagate original 404
+        raise
 
 # ------------------------------------------------------------
 # ENDPOINT: /file
@@ -459,7 +483,7 @@ async def file_get(
     return {"path": path, "ref": data["ref"], "sha": data["sha"], "content": data["content"]}
 
 # ------------------------------------------------------------
-# ENDPOINT: /deps (single-hop)
+# ENDPOINT: /deps (single-hop) with internal parse
 # ------------------------------------------------------------
 @app.get("/deps")
 @app.get("/deps/")
@@ -495,13 +519,14 @@ async def deps_get(
     }
 
 # ------------------------------------------------------------
-# ENDPOINT: /resolve (recursive multi-hop BFS)
+# ENDPOINT: /resolve (recursive multi-hop BFS) with fallback retry
 # ------------------------------------------------------------
 @app.post("/resolve")
 @app.post("/resolve/")
 async def resolve_post(payload: Dict[str, Any] = Body(...)):
     """
     BFS recursion: expands dependencies up to max_depth internally.
+    Includes retry fallbacks for misclassified folders (Tables↔Classes↔Forms↔Maps).
     """
     env = get_env()
     start_file: str = payload.get("start_file")
@@ -519,40 +544,58 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
     current_level: List[str] = [start_file]
     depth = 0
 
-    async def safe_deps(file: str):
+    async def deps_get_with_fallback(file: str, ref: Optional[str]):
         try:
-            node = await deps_get(file=file, ref=used_ref, page=1, limit=200)  # type: ignore
-            implicit_all.extend(node.get("implicit_crud", []))
-            return {"file": file, "deps": node.get("dependencies", []), "error": None}
-        except Exception as e:
-            log.error(f"[resolve] Failed deps_get for {file}: {e}")
-            return {"file": file, "deps": None, "error": str(e)}
+            node = await deps_get(file=file, ref=ref, page=1, limit=200)  # type: ignore
+            return file, node
+        except HTTPException as e:
+            if e.status_code != 404:
+                raise
+            # try alternatives
+            folder, symbol = _split_folder_symbol(file)
+            if not folder or not symbol:
+                raise
+            for alt in _alt_folders_for(folder):
+                candidate = f"{alt}/{symbol}.xpo"
+                try:
+                    node = await deps_get(file=candidate, ref=ref, page=1, limit=200)  # type: ignore
+                    log.info(f"[resolve.fallback] {file} -> {candidate}")
+                    return candidate, node
+                except HTTPException as ee:
+                    if ee.status_code == 404:
+                        continue
+                    else:
+                        raise
+            # propagate original 404 if no alt works
+            raise
 
     while current_level and depth < max_depth:
         log.info(f"[resolve] Depth {depth}: {len(current_level)} files")
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
 
-        results = await asyncio.gather(*[safe_deps(f) for f in level_files])
+        results = await asyncio.gather(*[deps_get_with_fallback(f, used_ref) for f in level_files], return_exceptions=True)
 
         next_level: List[str] = []
         for res in results:
-            file = res["file"]
-            err = res.get("error")
-            deps = res.get("deps") or []
-            if err:
-                graph.append({"file": file, "error": err, "depth": depth, "dependencies": []})
+            if isinstance(res, Exception):
+                # Unable to resolve this node
+                graph.append({"file": "unknown", "error": str(res), "depth": depth, "dependencies": []})
                 continue
 
+            real_file, node = res  # corrected path (may equal original), deps payload
+            implicit_all.extend(node.get("implicit_crud", []))
+
             dep_paths: List[str] = []
-            for d in deps:
-                clean = _normalize_dep_path(d.get("path") or "")
+            for d in node.get("dependencies", []):
+                raw = d.get("path") or ""
+                clean = _normalize_dep_path(raw)
                 if _should_skip_dep_path(clean):
                     continue
                 dep_paths.append(clean)
 
             graph.append({
-                "file": file,
+                "file": real_file,
                 "depth": depth,
                 "dependencies": dep_paths,
                 "error": None
@@ -560,7 +603,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
             next_level.extend(dep_paths)
 
         depth += 1
-        current_level = [f for f in set(next_level) if f not in visited]
+        current_level = [f for f in dict.fromkeys(next_level) if f not in visited]
 
     return {
         "root": start_file,
@@ -643,7 +686,7 @@ def _json_ok(result: Dict[str, Any], budget_bytes: int = 3_000_000) -> JSONRespo
     )
 
 # ------------------------------------------------------------
-# /report with deadline, summary mode, caching, breadth caps, trims
+# /report with deadline, summary mode, caching, breadth caps, fallbacks
 # ------------------------------------------------------------
 class _ReqScopeCache:
     def __init__(self):
@@ -653,16 +696,26 @@ class _ReqScopeCache:
 async def _analyze_single_file(path: str, ref: Optional[str], file_get_fn, deps_get_fn, deadline_ms: int) -> Dict[str, Any]:
     if _deadline_expired(deadline_ms):
         return {"path": path, "ref": ref, "error": "deadline_exceeded"}
+
+    corrected_from = None
+    # Resolve correct path with fallbacks before fetching
     try:
-        file_res = await file_get_fn(path=path, ref=ref)
-    except Exception as e:
-        return {"path": path, "ref": ref, "error": f"file_get: {e}"}
+        resolved_path, corrected_from = await _resolve_existing_path_with_fallbacks(path, ref)
+    except HTTPException as e:
+        if e.status_code == 404:
+            return {"path": path, "ref": ref, "error": "file_get: 404 not found (no folder fallback)"}
+        return {"path": path, "ref": ref, "error": f"file_get: {e.status_code}"}
 
     try:
-        deps_res = await deps_get_fn(file=path, ref=ref)
+        file_res = await file_get_fn(path=resolved_path, ref=ref)
+    except Exception as e:
+        return {"path": resolved_path, "ref": ref, "error": f"file_get: {e}"}
+
+    try:
+        deps_res = await deps_get_fn(file=resolved_path, ref=ref)
     except Exception as e:
         return {
-            "path": path, "ref": ref,
+            "path": resolved_path, "ref": ref,
             "sha": file_res.get("sha"),
             "content_len": len(file_res.get("content", "")),
             "dependencies": [], "business_rules": [], "implicit_crud": [],
@@ -683,8 +736,8 @@ async def _analyze_single_file(path: str, ref: Optional[str], file_get_fn, deps_
     if _time_left(deadline_ms) < 5000 and len(norm_deps) > 200:
         norm_deps = norm_deps[:200]
 
-    return {
-        "path": path,
+    out = {
+        "path": resolved_path,
         "ref": deps_res.get("ref", ref),
         "sha": deps_res.get("sha") or file_res.get("sha", "unknown"),
         "content_len": len(file_res.get("content", "")),
@@ -693,12 +746,16 @@ async def _analyze_single_file(path: str, ref: Optional[str], file_get_fn, deps_
         "implicit_crud": deps_res.get("implicit_crud", []),
         "error": None,
     }
+    if corrected_from:
+        out["corrected_from"] = corrected_from
+    return out
 
 @app.post("/report")
 @app.post("/report/")
 async def report_post(payload: Dict[str, Any] = Body(...)):
     """
-    Full transitive analysis in one call with a hard deadline and summary mode.
+    Full transitive analysis in one call with a hard deadline, summary mode,
+    breadth caps, and folder-fallback retries for misclassified dependencies.
     Body:
       {
         "start_file": "Forms/mssBDAckTableFurn.xpo",
@@ -758,7 +815,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         scope.deps_json[key] = res
         return res
 
-    # --------- 1) internal resolve (bounded, deadline-aware) ----------
+    # --------- 1) internal resolve (bounded, deadline-aware) with fallbacks ----------
     visited: Set[str] = set()
     graph: List[Dict[str, Any]] = []
     implicit_all: List[Dict[str, Any]] = []
@@ -766,14 +823,34 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     depth = 0
     overflow = False
 
-    async def safe_deps(file: str):
+    # Map of corrections found during resolve: original -> corrected
+    corrections: Dict[str, str] = {}
+
+    async def deps_get_with_fallback(file: str, ref: Optional[str]) -> Tuple[str, Dict[str, Any]]:
         try:
-            node = await deps_get_cached(file=file, ref=used_ref)
-            implicit_all.extend(node.get("implicit_crud", []))
-            return {"file": file, "deps": node.get("dependencies", []), "error": None}
-        except Exception as e:
-            log.error(f"[report] deps_get failed for {file}: {e}")
-            return {"file": file, "deps": None, "error": str(e)}
+            node = await deps_get_cached(file=file, ref=ref)
+            return file, node
+        except HTTPException as e:
+            if e.status_code != 404:
+                raise
+            # Try alternatives
+            folder, symbol = _split_folder_symbol(file)
+            if not folder or not symbol:
+                raise
+            for alt in _alt_folders_for(folder):
+                candidate = f"{alt}/{symbol}.xpo"
+                try:
+                    node = await deps_get_cached(file=candidate, ref=ref)
+                    log.info(f"[report.resolve.fallback] {file} -> {candidate}")
+                    corrections[file] = candidate
+                    return candidate, node
+                except HTTPException as ee:
+                    if ee.status_code == 404:
+                        continue
+                    else:
+                        raise
+            # Re-raise original 404
+            raise
 
     while current_level and depth < max_depth and not _deadline_expired(deadline):
         if len(current_level) > level_cap:
@@ -783,23 +860,25 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
 
-        results = await asyncio.gather(*[safe_deps(f) for f in level_files])
+        results = await asyncio.gather(*[deps_get_with_fallback(f, used_ref) for f in level_files], return_exceptions=True)
         next_level: List[str] = []
 
         for res in results:
-            file = res["file"]
-            if res.get("error"):
-                graph.append({"file": file, "depth": depth, "dependencies": [], "error": res["error"]})
+            if isinstance(res, Exception):
+                graph.append({"file": "unknown", "depth": depth, "dependencies": [], "error": str(res)})
                 continue
 
+            real_file, node = res
+            implicit_all.extend(node.get("implicit_crud", []))
+
             dep_paths: List[str] = []
-            for d in (res.get("deps") or []):
+            for d in node.get("dependencies", []):
                 clean = _normalize_dep_path(d.get("path") or "")
                 if _should_skip_dep_path(clean):
                     continue
                 dep_paths.append(clean)
 
-            graph.append({"file": file, "depth": depth, "dependencies": dep_paths, "error": None})
+            graph.append({"file": real_file, "depth": depth, "dependencies": dep_paths, "error": None})
             next_level.extend(dep_paths)
 
         depth += 1
@@ -809,9 +888,19 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
 
         current_level = [f for f in dict.fromkeys(next_level) if f not in visited]
 
+    # Apply path corrections to visited set
+    if corrections:
+        new_visited: Set[str] = set()
+        for v in visited:
+            new_visited.add(corrections.get(v, v))
+        visited = new_visited
+        # Also rewrite graph file names to corrected ones
+        for g in graph:
+            g["file"] = corrections.get(g["file"], g["file"])
+
     visited_list = sorted(list(visited))
 
-    # --------- 2) analyze (bounded concurrency, deadline-aware) ----------
+    # --------- 2) analyze (bounded concurrency, deadline-aware) w/ fallbacks ----------
     sem = Semaphore(max_conc)
     async def _guarded_analyze(p: str):
         if _deadline_expired(deadline):
@@ -832,7 +921,17 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     business_rules_all: List[Dict[str, Any]] = []
     implicit_crud_all: List[Dict[str, Any]] = list(implicit_all)
 
+    # Build depth index after any corrections
     depth_index = {g["file"]: g["depth"] for g in graph}
+
+    # Map any analysis corrections back into the graph index if needed
+    for a in analyses:
+        # If analyzer returned corrected_from, ensure both map to same depth
+        corrected_from = a.get("corrected_from")
+        if corrected_from and a.get("path"):
+            if corrected_from in depth_index and a["path"] not in depth_index:
+                depth_index[a["path"]] = depth_index[corrected_from]
+
     for a in analyses:
         objects.append({
             "path": a.get("path"),
@@ -863,12 +962,14 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         dedup_edges.append(e)
 
     # Hard trims for oversized
+    MAX_EDGES_ENV = int(os.getenv("MAX_EDGES", "12000"))
+    MAX_RULES_ENV = int(os.getenv("MAX_RULES", "5000"))
     trimmed = False
-    if len(dedup_edges) > MAX_EDGES:
-        dedup_edges = dedup_edges[:MAX_EDGES]
+    if len(dedup_edges) > MAX_EDGES_ENV:
+        dedup_edges = dedup_edges[:MAX_EDGES_ENV]
         trimmed = True
-    if len(business_rules_all) > MAX_RULES:
-        business_rules_all = business_rules_all[:MAX_RULES]
+    if len(business_rules_all) > MAX_RULES_ENV:
+        business_rules_all = business_rules_all[:MAX_RULES_ENV]
         trimmed = True
 
     status_parts = []
@@ -894,5 +995,4 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         "implicit_crud": implicit_crud_all if mode == "full" else implicit_crud_all[:top_n],
         "status": " ; ".join(status_parts)
     }
-    # Enforce a response size budget (default ~3MB) and force JSON+charset
     return _json_ok(result, budget_bytes=int(os.getenv("REPORT_BUDGET_BYTES", "3000000")))
