@@ -260,78 +260,83 @@ async def deps_get_trailing(
 @app.post("/resolve")
 async def resolve_post(payload: Dict[str, Any] = Body(...)):
     """
-    Recursively resolves dependencies up to max_depth.
-    Options:
-      - ref: branch/SHA (HEAD auto-normalized to DEFAULT_REF)
-      - include_content (bool): include raw .xpo content for each visited file
-      - verify_paths (bool): probe ADO before recursing to avoid 404 branches
-    """
-    start_file: str = payload["start_file"]
-    max_depth: int = int(payload.get("max_depth", 5))
-    req_ref: Optional[str] = payload.get("ref")
-    include_content: bool = bool(payload.get("include_content", False))
-    verify_paths: bool = bool(payload.get("verify_paths", False))
+    Server-side BFS recursion: expands dependencies up to max_depth internally
+    (no external flow required).
 
+    Body:
+      {
+        "start_file": "Forms/mssBDAckTableFurn.xpo",
+        "ref": "main",
+        "max_depth": 5
+      }
+    """
     env = get_env()
-    used_ref = (req_ref or env["REF"])
+    start_file: str = payload["start_file"]
+    used_ref = payload.get("ref") or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
+    max_depth = int(payload.get("max_depth", 5))
 
     visited: Set[str] = set()
     graph: List[Dict[str, Any]] = []
     implicit_all: List[Dict[str, Any]] = []
+    current_level: List[str] = [start_file]
+    depth = 0
 
-    async def enqueue_node(file: str, depth: int, deps: Optional[List[Dict[str, Any]]], error: Optional[str]):
-        node: Dict[str, Any] = {
-            "file": file,
-            "depth": depth,
-            "error": error,
-            "dependencies": None if deps is None else [d["path"] for d in deps],
-        }
-        if include_content and error is None:
-            try:
-                content_obj = await get_item_content(file, used_ref)
-                node["ref"] = content_obj["ref"]
-                node["sha"] = content_obj["sha"]
-                node["content"] = content_obj["content"]
-            except Exception as e:
-                node["content_error"] = str(e)
-        graph.append(node)
-
-    async def crawl(file: str, depth: int):
-        if depth > max_depth:
-            return
-        if file in visited:
-            return
-        visited.add(file)
+    async def safe_deps(file: str):
         try:
             node = await deps_get(file=file, ref=used_ref, page=1, limit=200)  # type: ignore
-            deps = node["dependencies"]
             implicit_all.extend(node["implicit_crud"])
-            await enqueue_node(file, depth, deps, None)
-            for d in deps:
-                target = d["path"]
-                if target in visited:
-                    continue
-                if verify_paths:
-                    try:
-                        await get_item_content(target, used_ref)
-                    except Exception as e:
-                        await enqueue_node(target, depth + 1, None, str(e))
-                        continue
-                await crawl(target, depth + 1)
+            return {"file": file, "deps": node["dependencies"], "error": None}
         except Exception as e:
-            await enqueue_node(file, depth, None, str(e))
+            return {"file": file, "deps": None, "error": str(e)}
 
-    await crawl(start_file, 0)
+    while current_level and depth < max_depth:
+        log.info(f"[resolve] Depth {depth} processing {len(current_level)} files...")
+        # Deduplicate level
+        level_files = [f for f in current_level if f not in visited]
+        visited.update(level_files)
+        # Fetch all in parallel
+        results = await asyncio.gather(*[safe_deps(f) for f in level_files])
+
+        next_level: List[str] = []
+        for res in results:
+            file = res["file"]
+            deps = res.get("deps")
+            err = res.get("error")
+            if err:
+                graph.append({"file": file, "error": err, "depth": depth, "dependencies": None})
+                continue
+
+            # Collect dependency paths for next wave
+            dep_paths: List[str] = []
+            for d in deps:
+                raw = d["path"]
+                # strip lcl prefixes once more (in case deeper levels produce them)
+                clean = re.sub(r"(^|/)(lcl|Lcl)([A-Z])", lambda m: f"{m.group(1)}{m.group(3)}", raw)
+                dep_paths.append(clean)
+            next_level.extend(dep_paths)
+
+            graph.append({
+                "file": file,
+                "depth": depth,
+                "dependencies": dep_paths,
+                "error": None
+            })
+
+        # Move to next layer
+        depth += 1
+        # Drop already-seen files and duplicates
+        current_level = [f for f in set(next_level) if f not in visited]
 
     return {
         "root": start_file,
         "ref": used_ref,
-        "depth": max_depth,
+        "max_depth": max_depth,
+        "depth_completed": depth,
         "total_files": len(visited),
         "visited": sorted(list(visited)),
         "implicit_crud": implicit_all,
         "graph": graph,
-        "status": "complete",
+        "status": "complete"
     }
