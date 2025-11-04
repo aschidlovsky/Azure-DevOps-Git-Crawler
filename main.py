@@ -306,15 +306,15 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
                 continue
 
             dep_paths: List[str] = []
-            for d in deps:
-                raw = d.get("path") or ""
-                # defensive cleanup
-                clean = re.sub(
-                    r"(^|/)(lclmss|lcl|Lclmss|Lcl)([A-Z])",
-                    lambda m: f"{m.group(1)}{m.group(3)}",
-                    raw,
-                )
-                dep_paths.append(clean)
+                for d in deps:
+                    raw = d.get("path") or ""
+                    # Normalize "lcl" prefix (including 'lclmss' variants) but keep 'mss'
+                    clean = re.sub(
+                        r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
+                        lambda m: f"{m.group(1)}{(m.group(3) or '')}{m.group(4)}",
+                        raw,
+                    )
+                    dep_paths.append(clean)
             graph.append({
                 "file": file,
                 "depth": depth,
