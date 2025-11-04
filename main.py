@@ -7,7 +7,7 @@ import httpx
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.4")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,13 +59,12 @@ async def health():
     return {"status": "ok"}
 
 # ------------------------------------------------------------
-# FETCH FILE CONTENT FROM ADO (includes HEAD→default fix)
+# FETCH FILE CONTENT FROM ADO
 # ------------------------------------------------------------
 async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     env = get_env()
     base = ado_base(env)
 
-    # Normalize HEAD → env default
     used_ref = ref or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
@@ -81,7 +80,6 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.get(url, headers=ado_headers(env["PAT"]), params=params)
 
-        # Auth/redirect guard
         if r.status_code == 302 or "text/html" in r.headers.get("content-type", ""):
             raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
 
@@ -96,13 +94,12 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         try:
             data = r.json()
         except Exception:
-            raise HTTPException(502, "Azure DevOps returned non-JSON content (likely auth redirect).")
+            raise HTTPException(502, "Azure DevOps returned non-JSON content.")
 
         content = data.get("content")
         if not content:
-            raise HTTPException(404, "No content found for this path (might be binary or empty).")
+            raise HTTPException(404, "No content found (might be binary or empty).")
 
-        # Base64 → text if needed
         try:
             content = base64.b64decode(content).decode("utf-8")
         except Exception:
@@ -117,35 +114,17 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 # ------------------------------------------------------------
 # LIGHTWEIGHT PARSER
 # ------------------------------------------------------------
-
-# Patterns for hints
 DEPENDENCY_PATTERNS = [
-    # Naive "verb + token" (we'll filter tokens)
     (r"\b(select|insert|update|delete)\s+(\w+)", "Table", "statement"),
-    # DataSource() often indicates a table buffer
     (r"\b(\w+)\.DataSource\(", "Table", "DataSource()"),
-    # Class usage
     (r"\b(\w+)::(construct|new|run)\b", "Class", "static-call"),
     (r"\bnew\s+(\w+)\s*\(", "Class", "new"),
-    # Explicit CRUD calls on a buffer/record
     (r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", "Table", "crud-call"),
 ]
 
 CRUD_SIGNATURE = re.compile(r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", re.IGNORECASE)
-
-# Framework/kernel and common noise tokens to skip
 KERNEL_SKIP = {"FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase"}
-STOPWORDS = {
-    # X++ select/where modifiers and noise
-    "forupdate", "firstonly", "firstfast", "nofetch", "index", "group", "order", "by", "asc", "desc",
-    "exists", "notexists", "outer", "join", "where", "like", "as", "from", "to", "cross", "container",
-    # common tokens and keywords
-    "this", "the", "super", "true", "false", "null", "element", "display", "edit",
-    # common field names / meta
-    "recid", "tableid", "fieldid",
-    # generic types that showed up as false positives
-    "map",  # we don't want "Classes/Map.xpo"
-}
+STOPWORDS = {"forupdate", "firstonly", "nofetch", "this", "the", "recid", "map", "true", "false", "null"}
 
 TYPE_DIR = {"Table": "Tables", "Class": "Classes", "Form": "Forms", "Map": "Maps"}
 
@@ -154,33 +133,23 @@ def default_path_for(symbol: str, kind: str) -> str:
     return f"{folder}/{symbol}.xpo"
 
 def is_noise_symbol(symbol: str) -> bool:
-    s = symbol.lower()
-    if s in STOPWORDS:
-        return True
-    # super short or generic tokens tend to be noise
-    if len(s) <= 2:
-        return True
-    return False
+    return symbol.lower() in STOPWORDS or len(symbol) <= 2
 
 def extract_dependencies(content: str) -> Dict[str, Any]:
-    deps: List[Dict[str, Any]] = []
-    implicit: List[Dict[str, Any]] = []
-    business: List[Dict[str, Any]] = []
-    seen: Set[Tuple[str, str]] = set()  # (kind, symbol) to de-dupe
+    deps, implicit, business = [], [], []
+    seen: Set[Tuple[str, str]] = set()
 
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
         for m in re.finditer(pattern, content, re.IGNORECASE):
             symbol = m.group(2) if reason == "statement" else m.group(1)
-            if not symbol:
-                continue
-            if symbol in KERNEL_SKIP or is_noise_symbol(symbol):
+            if not symbol or symbol in KERNEL_SKIP or is_noise_symbol(symbol):
                 continue
             key = (kind, symbol)
             if key in seen:
                 continue
             seen.add(key)
             deps.append({
-                "path": default_path_for(symbol, kind),  # type-based folder guess
+                "path": default_path_for(symbol, kind),
                 "type": kind,
                 "symbol": symbol,
                 "reason": reason
@@ -201,19 +170,19 @@ def extract_dependencies(content: str) -> Dict[str, Any]:
 @app.get("/file")
 @app.get("/file/")
 async def file_get(
-    path: str = Query(..., description="Repo path (e.g., Forms/CustTable.xpo)"),
+    path: str = Query(...),
     ref: Optional[str] = Query(None),
 ):
     data = await get_item_content(path, ref)
     return {"path": path, "ref": data["ref"], "sha": data["sha"], "content": data["content"]}
 
 # ------------------------------------------------------------
-# ENDPOINT: /deps (single-hop)
+# ENDPOINT: /deps
 # ------------------------------------------------------------
 @app.get("/deps")
 @app.get("/deps/")
 async def deps_get(
-    file: str = Query(..., description="Repo path to .xpo file"),
+    file: str = Query(...),
     ref: Optional[str] = Query(None),
     page: int = 1,
     limit: int = 200,
@@ -221,7 +190,6 @@ async def deps_get(
     fetched = await get_item_content(file, ref)
     content, sha, used_ref = fetched["content"], fetched["sha"], fetched["ref"]
     parsed = extract_dependencies(content)
-
     start, end = (page - 1) * limit, (page - 1) * limit + limit
     paged = parsed["dependencies"][start:end]
     total = len(parsed["dependencies"])
@@ -234,7 +202,6 @@ async def deps_get(
         "dependencies": paged,
         "business_rules": parsed["business_rules"],
         "implicit_crud": parsed["implicit_crud"],
-        # If you later add ADO path probing, unresolved can be upgraded — for now we only mark UNKNOWN/
         "unresolved": [d for d in parsed["dependencies"] if d["path"].startswith("UNKNOWN/")],
         "visited": [file],
         "skipped": [],
@@ -245,16 +212,22 @@ async def deps_get(
     }
 
 # ------------------------------------------------------------
-# ENDPOINT: /resolve (multi-hop)
+# ENDPOINT: /resolve (recursive multi-hop expansion)
 # ------------------------------------------------------------
 @app.post("/resolve")
 @app.post("/resolve/")
 async def resolve_post(payload: Dict[str, Any] = Body(...)):
+    """
+    Recursively resolves dependencies up to max_depth.
+    For each dependency discovered, fetches its dependencies automatically.
+    """
     start_file = payload["start_file"]
     max_depth = int(payload.get("max_depth", 5))
     used_ref = payload.get("ref", "main")
+
     visited: Set[str] = set()
-    graph, implicit_all = [], []
+    graph: List[Dict[str, Any]] = []
+    implicit_all: List[Dict[str, Any]] = []
 
     async def crawl(file: str, depth: int):
         if depth > max_depth or file in visited:
@@ -262,14 +235,13 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
         visited.add(file)
         try:
             node = await deps_get(file=file, ref=used_ref, page=1, limit=200)  # type: ignore
+            deps = node["dependencies"]
+            implicit_all.extend(node["implicit_crud"])
+            graph.append({"file": file, "dependencies": [d["path"] for d in deps], "error": None})
+            for d in deps:
+                await crawl(d["path"], depth + 1)
         except Exception as e:
-            graph.append({"file": file, "error": str(e)})
-            return
-        deps = node["dependencies"]
-        implicit_all.extend(node["implicit_crud"])
-        graph.append({"file": file, "dependencies": [d["path"] for d in deps]})
-        for d in deps:
-            await crawl(d["path"], depth + 1)
+            graph.append({"file": file, "error": str(e), "dependencies": None})
 
     await crawl(start_file, 0)
 
@@ -278,6 +250,8 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
         "depth": max_depth,
         "graph": graph,
         "implicit_crud": implicit_all,
-        "skipped": [],
         "visited": sorted(list(visited)),
+        "total_files": len(visited),
+        "skipped": [],
+        "status": "complete"
     }
