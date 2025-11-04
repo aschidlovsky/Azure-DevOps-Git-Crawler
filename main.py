@@ -46,11 +46,123 @@ def ado_headers(pat: str) -> Dict[str, str]:
         "Authorization": f"Basic {basic}",
         "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
-        "User-Agent": "ado-git-crawler/1.0",
+        "User-Agent": "ado-git-crawler/1.2",
     }
 
 def ado_base(env: Dict[str, str]) -> str:
     return f"https://dev.azure.com/{env['ORG']}/{env['PROJECT']}/_apis/git/repositories/{env['REPO']}"
+
+# ------------------------------------------------------------
+# SYMBOL FILTERING / CLASSIFICATION HELPERS
+# ------------------------------------------------------------
+TYPE_PATHS = {
+    "Table": "Tables",
+    "Class": "Classes",
+    "Form": "Forms",
+    "Map": "Maps",
+    "Unknown": "Unknown",
+}
+
+ALLOWED_FOLDERS = {"Tables", "Classes", "Forms", "Maps"}
+
+# Expanded skip: kernel/system names & common false positives
+KERNEL_SKIP = {
+    # Kernel/system typical symbols or tokens
+    "FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase",
+    "Map", "List", "Array", "Tmp", "TmpTable", "Info", "Error", "Warning",
+    "Query", "QueryRun", "SysQuery", "SysTable", "SysDictTable", "SysDictField",
+    "TableId", "DataAreaId", "Company",
+    # Common tokens / short identifiers
+    "RecId", "t", "x", "y", "z", "this", "super",
+    # X++ keywords accidentally captured
+    "sum", "avg", "min", "max", "count", "len", "is", "the", "for", "select", "firstOnly",
+    "exists", "update_recordset", "delete_from", "insert_recordset"
+}
+
+# Additional aggressive meta/kernel guards for early exit
+LIKELY_KERNEL_META_PREFIXES: Tuple[str, ...] = (
+    "Dict", "Sys", "Menu", "Info", "Error", "Warning", "Global"
+)
+LIKELY_KERNEL_META_EXACT: Set[str] = {
+    "Label", "MenuFunction", "MapIterator", "MapEnumerator"
+}
+
+EDT_LIKE_SUFFIXES: Tuple[str, ...] = (
+    "Id", "Qty", "Price", "Amount", "Code", "Group", "TypeId"
+)
+
+def _looks_like_edt_name(symbol: str) -> bool:
+    if not symbol: return False
+    return any(symbol.endswith(suf) for suf in EDT_LIKE_SUFFIXES)
+
+def _is_candidate_symbol(symbol: str) -> bool:
+    # Only accept PascalCase-ish symbols: first char uppercase alpha.
+    return bool(symbol) and symbol[0].isalpha() and symbol[0].isupper()
+
+def _normalize_dep_path(p: str) -> str:
+    """
+    Strip 'lcl' or 'Lcl' prefix (including 'lclmss') while preserving 'mss'
+    Examples:
+      Tables/lclPurchLine.xpo   -> Tables/PurchLine.xpo
+      Tables/lclmssBDAck.xpo    -> Tables/mssBDAck.xpo   (keep 'mss')
+    """
+    return re.sub(
+        r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
+        lambda m: f"{m.group(1)}{(m.group(3) or '')}{m.group(4)}",
+        p or "",
+    )
+
+def _should_skip_dep_path(p: str) -> bool:
+    """
+    Returns True if this normalized path should be ignored (kernel/system/junk).
+    Expects 'Tables/PurchLine.xpo' etc.
+    """
+    if not p or ".xpo" not in p:
+        return True
+    m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", p)
+    if not m:
+        return True
+    folder, symbol = m.group(1), m.group(2)
+    if folder not in ALLOWED_FOLDERS:
+        return True
+    if symbol in KERNEL_SKIP:
+        return True
+    if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
+        return True
+    if symbol.lower() in {
+        "sum","avg","min","max","count","len","is","the","for","select","firstonly",
+        "exists","update_recordset","delete_from","insert_recordset","this","super"
+    }:
+        return True
+    if len(symbol) < 3:
+        return True
+    if not _is_candidate_symbol(symbol):
+        return True
+    if _looks_like_edt_name(symbol):
+        return True
+    return False
+
+def _fallback_kinds_on_404(kind: str, symbol: str) -> List[str]:
+    """
+    Targeted reclassification:
+    - Only Table -> Class and only when symbol endswith 'Type' or startswith 'Ax'
+    - Never reclassify EDT-like or kernel/meta candidates
+    """
+    if not _is_candidate_symbol(symbol):
+        return []
+    if _looks_like_edt_name(symbol):
+        return []
+    if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
+        return []
+
+    if kind == "Table":
+        if symbol.endswith("Type") or symbol.startswith("Ax"):
+            return ["Class"]
+        return []
+    return []
+
+def _looks_like_form_path(file_path: str) -> bool:
+    return file_path.startswith("Forms/") or (file_path.lower().endswith(".xpo") and "/forms/" in file_path.lower())
 
 # ------------------------------------------------------------
 # HEALTH CHECK
@@ -85,7 +197,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         r = await client.get(url, headers=ado_headers(env["PAT"]), params=params)
 
         # Guard against HTML login redirects
-        if r.status_code == 302 or "text/html" in (r.headers.get("content-type") or ""):
+        if r.status_code == 302 or "text/html" in r.headers.get("content-type", ""):
             raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
 
         if r.status_code == 404:
@@ -139,183 +251,17 @@ FORM_DS_PATTERNS = [
 ]
 
 CRUD_SIGNATURE = re.compile(
-    r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete|write)\s*\(",
-    re.IGNORECASE
+    r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete|write)\s*\(", re.IGNORECASE
 )
 
-# Expanded skip: kernel/system names & common false positives
-KERNEL_SKIP = {
-    # Kernel/system
-    "FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase",
-    "Map", "List", "Array", "Tmp", "TmpTable", "Info", "Error", "Warning",
-    "Query", "QueryRun", "SysQuery", "SysTable", "SysDictTable", "SysDictField",
-    "TableId", "DataAreaId", "Company",
-    # Common tokens / short identifiers
-    "RecId", "t", "x", "y", "z", "this", "super",
-    # X++ keywords accidentally captured
-    "sum", "avg", "min", "max", "count", "len", "is", "the", "for", "select", "firstOnly",
-    "exists", "update_recordset", "delete_from", "insert_recordset"
-}
+# which CRUD methods to consider on DS tables regardless of AllowCreate/Delete flags
+FORMS_DS_IMPLICIT_METHODS = ["insert()", "update()", "delete()", "validateWrite()", "write()", "validateDelete()"]
 
-# Additional symbols that are usually metadata/framework (tend to 404 in custom repos)
-LIKELY_KERNEL_META_PREFIXES = ("Dict", "ImageListAppl_", "Menu", "MenuFunction", "Label")
-LIKELY_KERNEL_META_EXACT = {
-    "DictTable", "DictField", "DictEnum", "DictRelation", "DictType", "Label"
-}
-
-TYPE_PATHS = {
-    "Table": "Tables",
-    "Class": "Classes",
-    "Form": "Forms",
-    "Map": "Maps",
-    "Unknown": "Unknown"
-}
-
-ALLOWED_FOLDERS = {"Tables", "Classes", "Forms", "Maps"}
-
-# ------------------------------------------------------------
-# Invocation extraction (form & DS methods → called targets)
-# ------------------------------------------------------------
-METHOD_HEADER = re.compile(
-    r"\b(BEGINMETHOD\s+)?(?P<name>(init|run|closeOk|close|clicked|modified|active|write|validateWrite|validateDelete))\s*\(",
-    re.IGNORECASE
-)
-DS_METHOD_REGION = re.compile(
-    r"\bOBJECT\s+FORM\s+DATASOURCE\b.*?\bMETHODS\b(?P<body>.*?)\bENDMETHODS\b",
-    re.IGNORECASE | re.DOTALL
-)
-CALL_SITE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.MULTILINE)
-INTERESTING_TARGET = re.compile(r"\b(mss[A-Za-z0-9_]*Comparer|completeAckConfirm|initAck|acceptPrices)\b")
-
-def _extract_invocation_paths(content: str) -> List[Dict[str, Any]]:
-    """
-    Heuristic: find entrypoint-like methods, then list notable calls inside.
-    Returns: [{"entry": "init()", "calls": ["initAck()", "mssBDAckTableComparer::..."]}, ...]
-    """
-    invocations: List[Dict[str, Any]] = []
-
-    def scan_block(block_text: str, entry_label_prefix: str = ""):
-        for m in METHOD_HEADER.finditer(block_text):
-            entry = m.group("name")
-            start = m.start()
-            next_m = METHOD_HEADER.search(block_text, pos=m.end())
-            end = next_m.start() if next_m else len(block_text)
-            body = block_text[start:end]
-
-            calls: List[str] = []
-            for cm in CALL_SITE.finditer(body):
-                callee = cm.group(1)
-                if INTERESTING_TARGET.search(callee):
-                    calls.append(callee + "()")
-
-            if calls:
-                label = f"{entry_label_prefix}{entry}()"
-                seen = set()
-                ordered = []
-                for c in calls:
-                    if c not in seen:
-                        seen.add(c)
-                        ordered.append(c)
-                invocations.append({"entry": label, "calls": ordered})
-
-    # 1) Top-level form methods
-    scan_block(content, entry_label_prefix="")
-    # 2) DataSource method regions
-    for dsm in DS_METHOD_REGION.finditer(content):
-        ds_body = dsm.group("body") or ""
-        scan_block(ds_body, entry_label_prefix="DataSource.")
-    return invocations
-
-# ------------------------------------------------------------
-# HELPERS: path normalization, filtering, and reclassification retries
-# ------------------------------------------------------------
-def _looks_like_form_path(file_path: str) -> bool:
-    return file_path.startswith("Forms/") or (file_path.lower().endswith(".xpo") and "/forms/" in file_path.lower())
-
-EDT_LIKE_SUFFIXES = ("Id", "Qty", "Price", "Amount", "Code", "Group", "TypeId")
-def _looks_like_edt_name(symbol: str) -> bool:
-    # coarse heuristic: starts uppercase, short-ish, and ends like an EDT
-    if not symbol or len(symbol) < 3:
-        return False
-    if not symbol[0].isalpha() or not symbol[0].isupper():
-        return False
-    return symbol.endswith(EDT_LIKE_SUFFIXES)
-
-def _should_skip_dep_path(p: str) -> bool:
-    """
-    Returns True if this normalized path should be ignored (kernel/system/junk/EDT-likes).
-    Expects 'Tables/PurchLine.xpo' etc.
-    """
-    if not p or ".xpo" not in p:
-        return True
-    m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", p)
-    if not m:
-        return True
-    folder, symbol = m.group(1), m.group(2)
-    if folder not in ALLOWED_FOLDERS:
-        return True
-    if symbol in KERNEL_SKIP:
-        return True
-    if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
-        return True
-    if len(symbol) < 3:
-        return True
-    # If we ever mis-detected EDTs as Tables, prefer to skip them entirely.
-    if folder == "Tables" and _looks_like_edt_name(symbol):
-        return True
-    return False
-
-def _normalize_dep_path(p: str) -> str:
-    """
-    Strip 'lcl' or 'Lcl' prefix (including 'lclmss') while preserving 'mss'
-    Examples:
-      Tables/lclPurchLine.xpo   -> Tables/PurchLine.xpo
-      Tables/lclmssBDAck.xpo    -> Tables/mssBDAck.xpo   (keep 'mss')
-    """
-    return re.sub(
-        r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
-        lambda m: f"{m.group(1)}{(m.group(3) or '')}{m.group(4)}",
-        p or "",
-    )
-
-def _dep_tuple(dep: Dict[str, Any]) -> Tuple[str, str]:
-    return (dep.get("type") or "", dep.get("symbol") or "")
-
-def _initial_dep_path(kind: str, symbol: str) -> str:
-    folder = TYPE_PATHS.get(kind, "Unknown")
-    return f"{folder}/{symbol}.xpo"
-
-def _fallback_kinds_on_404(kind: str, symbol: str) -> List[str]:
-    """
-    If we 404 on the initial guess, try these kinds in order.
-    Key fix: PurchLineType/SalesLineType often detected as Tables, but are Classes.
-    """
-    # Always avoid EDTs (we don't support EDT folders, and they should be filtered)
-    if _looks_like_edt_name(symbol):
-        return []
-
-    fallbacks: List[str] = []
-    if kind == "Table":
-        # If it smells like a Type class, try Class first.
-        if symbol.endswith("Type") or symbol.startswith("Ax") or symbol in {"PriceDisc", "Dialog"}:
-            fallbacks.extend(["Class", "Form", "Map"])
-        else:
-            fallbacks.extend(["Class", "Form", "Map"])
-    elif kind == "Class":
-        fallbacks.extend(["Table", "Form", "Map"])
-    elif kind == "Form":
-        fallbacks.extend(["Class", "Table", "Map"])
-    else:
-        fallbacks.extend(["Class", "Table", "Form", "Map"])
-    return fallbacks
-
-# ------------------------------------------------------------
-# CORE EXTRACTOR
-# ------------------------------------------------------------
 def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
     deps: List[Dict[str, Any]] = []
     implicit: List[Dict[str, Any]] = []
     business: List[Dict[str, Any]] = []
+    invocations: List[str] = []
     dep_keys: Set[str] = set()
 
     # Direct dependency detection (with folder mapping)
@@ -324,16 +270,17 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             symbol = m.group(2) if reason == "statement" else m.group(1)
             if not symbol:
                 continue
+
+            # Hard stops
             if symbol in KERNEL_SKIP:
+                continue
+            if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
                 continue
             if len(symbol) < 3:
                 continue
-
-            # Skip likely kernel/meta early
-            if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
+            if not _is_candidate_symbol(symbol):
                 continue
-            # Skip likely EDTs early if detected as Table by the "statement" rule
-            if kind == "Table" and _looks_like_edt_name(symbol):
+            if _looks_like_edt_name(symbol):
                 continue
 
             folder = TYPE_PATHS.get(kind, "Unknown")
@@ -345,26 +292,37 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     # Explicit CRUD calls found in code
     for m in CRUD_SIGNATURE.finditer(content):
         table_sym = m.group(1)
-        if table_sym and table_sym not in KERNEL_SKIP and len(table_sym) >= 3:
-            implicit.append({
-                "table": table_sym,
-                "method": m.group(2) + "()",
-                "caller": "unknown",
-                "line": m.start()
-            })
+        if not table_sym:
+            continue
+        if table_sym in KERNEL_SKIP:
+            continue
+        if len(table_sym) < 3:
+            continue
+        if not _is_candidate_symbol(table_sym):
+            continue
+        if _looks_like_edt_name(table_sym):
+            continue
+
+        implicit.append({
+            "table": table_sym,
+            "method": m.group(2) + "()",
+            "caller": "unknown",
+            "line": m.start()
+        })
 
     # Form DS → implicit dependencies + implicit CRUD on save
     is_form = _looks_like_form_path(file_path or "")
+    ds_tables: Set[str] = set()
     if is_form:
-        ds_tables: Set[str] = set()
         for p in FORM_DS_PATTERNS:
-            for mm in re.finditer(p, content, re.IGNORECASE):
-                sym = mm.group(1)
+            for m in re.finditer(p, content, re.IGNORECASE):
+                sym = m.group(1)
                 if not sym:
                     continue
                 if sym in KERNEL_SKIP or len(sym) < 3:
                     continue
-                # Filter out EDT-ish names that occasionally appear in DS blocks
+                if not _is_candidate_symbol(sym):
+                    continue
                 if _looks_like_edt_name(sym):
                     continue
                 ds_tables.add(sym)
@@ -382,7 +340,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                     dep_keys.add(table_path)
 
             for sym in ds_tables:
-                for method in ["insert()", "update()", "delete()", "validateWrite()", "write()", "validateDelete()"]:
+                for method in FORMS_DS_IMPLICIT_METHODS:
                     implicit.append({
                         "table": sym,
                         "method": method,
@@ -391,19 +349,16 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                         "reason": "implicit-form-datasource-crud"
                     })
 
-    # Business-rule signals
+    # Business-rule signals + invocation cues
     for ln, line in enumerate(content.splitlines(), start=1):
-        if any(k in line for k in ["validate", "error(", "ttsBegin", "ttsCommit"]):
-            business.append({"line": ln, "context": line.strip()[:160]})
+        s = line.strip()
+        if any(k in s for k in ["validate", "error(", "ttsBegin", "ttsCommit"]):
+            business.append({"line": ln, "context": s[:160]})
+        # crude invocation hints (init/construct/run)
+        if re.search(r"\b(init|construct|run)\s*\(", s):
+            invocations.append(s[:160])
 
-    invocations = _extract_invocation_paths(content)
-
-    return {
-        "dependencies": deps,
-        "implicit_crud": implicit,
-        "business_rules": business,
-        "invocation_paths": invocations
-    }
+    return {"dependencies": deps, "implicit_crud": implicit, "business_rules": business, "invocations": invocations}
 
 # ------------------------------------------------------------
 # ENDPOINT: /file
@@ -444,7 +399,7 @@ async def deps_get(
         "dependencies": paged,
         "business_rules": parsed["business_rules"],
         "implicit_crud": parsed["implicit_crud"],
-        "invocation_paths": parsed.get("invocation_paths", []),
+        "invocations": parsed.get("invocations", []),
         "unresolved": [],
         "visited": [file],
         "skipped": [],
@@ -455,81 +410,59 @@ async def deps_get(
     }
 
 # ------------------------------------------------------------
-# INTERNAL: safe deps_get with 404 reclassification + filtering
+# INTERNAL: safe deps fetch with normalization + targeted 404 reclass
 # ------------------------------------------------------------
-async def _safe_deps_normalized(file: str, used_ref: str) -> Dict[str, Any]:
+async def _deps_with_reclass(file_path: str, ref: str) -> Dict[str, Any]:
     """
-    Calls deps_get for a 'file' path. If 404, attempts to reclassify the symbol
-    across alternative folders (Table→Class, etc.). Applies normalization + skip filter.
-    Returns: {"file": <original>, "deps": [normalized dep dicts], "implicit": [...],
-              "business": [...], "invocations": [...], "error": None or str}
+    Attempts deps_get(file_path, ref). If it 404s because the folder/type was wrong,
+    try a *targeted* reclass (Table -> Class) for *Type/Ax* symbols.
+    Returns dict with fields: file, deps, implicit, business, invocations, error, used_path
     """
-    async def _attempt(path: str) -> Optional[Dict[str, Any]]:
-        try:
-            node = await deps_get(file=path, ref=used_ref, page=1, limit=200)  # type: ignore
-            return node
-        except HTTPException as he:
-            if he.status_code == 404:
-                return None
-            raise
-        except Exception:
-            return None
+    try:
+        node = await deps_get(file=file_path, ref=ref, page=1, limit=200)  # type: ignore
+        return {
+            "file": file_path,
+            "used_path": file_path,
+            "deps": node.get("dependencies", []),
+            "implicit": node.get("implicit_crud", []),
+            "business": node.get("business_rules", []),
+            "invocations": node.get("invocations", []),
+            "error": None
+        }
+    except HTTPException as e:
+        if e.status_code != 404:
+            return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
+        # 404: consider Table -> Class retry if pattern matches
+        m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", file_path)
+        if not m:
+            return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
+        folder, symbol = m.group(1), m.group(2)
+        if not _is_candidate_symbol(symbol) or _looks_like_edt_name(symbol):
+            return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
+        if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
+            return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
 
-    # First try original
-    node = await _attempt(file)
-    tried_paths = [file]
+        kind_guess = "Table" if folder == "Tables" else "Unknown"
+        fallbacks = _fallback_kinds_on_404(kind_guess, symbol)
+        for fb_kind in fallbacks:
+            alt_path = f"{TYPE_PATHS.get(fb_kind, 'Unknown')}/{symbol}.xpo"
+            try:
+                node = await deps_get(file=alt_path, ref=ref, page=1, limit=200)  # type: ignore
+                return {
+                    "file": file_path,
+                    "used_path": alt_path,
+                    "deps": node.get("dependencies", []),
+                    "implicit": node.get("implicit_crud", []),
+                    "business": node.get("business_rules", []),
+                    "invocations": node.get("invocations", []),
+                    "error": None
+                }
+            except Exception:
+                continue  # give up silently if alt also fails
 
-    # If we failed, try reclassification based on symbol/kind
-    if node is None:
-        m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", file)
-        if m:
-            orig_folder, symbol = m.group(1), m.group(2)
-            # Skip kernel/meta or EDT-ish misses outright
-            if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
-                return {"file": file, "deps": [], "implicit": [], "business": [], "invocations": [], "error": None}
-
-            if _looks_like_edt_name(symbol):
-                return {"file": file, "deps": [], "implicit": [], "business": [], "invocations": [], "error": None}
-
-            # compute kind
-            inv_kind = None
-            for k, folder in TYPE_PATHS.items():
-                if folder == orig_folder:
-                    inv_kind = k
-                    break
-            kinds_to_try = _fallback_kinds_on_404(inv_kind or "Unknown", symbol)
-            for k in kinds_to_try:
-                alt = f"{TYPE_PATHS.get(k, 'Unknown')}/{symbol}.xpo"
-                if alt in tried_paths:
-                    continue
-                node = await _attempt(alt)
-                tried_paths.append(alt)
-                if node is not None:
-                    break
-
-    # If still nothing, return empty set (not an error)
-    if node is None:
-        return {"file": file, "deps": [], "implicit": [], "business": [], "invocations": [], "error": None}
-
-    # Normalize & filter deps for this node
-    norm_deps: List[Dict[str, Any]] = []
-    for d in node.get("dependencies", []) or []:
-        raw = d.get("path") or ""
-        clean = _normalize_dep_path(raw)
-        if _should_skip_dep_path(clean):
-            continue
-        nd = dict(d)
-        nd["path"] = clean
-        norm_deps.append(nd)
-
-    return {
-        "file": file,
-        "deps": norm_deps,
-        "implicit": node.get("implicit_crud", []) or [],
-        "business": node.get("business_rules", []) or [],
-        "invocations": node.get("invocation_paths", []) or [],
-        "error": None
-    }
+        return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
+    except Exception as e:
+        return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
 
 # ------------------------------------------------------------
 # ENDPOINT: /resolve (recursive multi-hop BFS)
@@ -571,22 +504,29 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
 
-        results = await asyncio.gather(*[_safe_deps_normalized(f, used_ref) for f in level_files])
+        results = await asyncio.gather(*[_deps_with_reclass(f) for f in level_files])
 
         next_level: List[str] = []
         for res in results:
             file = res["file"]
+            used_path = res.get("used_path", file)
             err = res.get("error")
             deps = res.get("deps") or []
             implicit_all.extend(res.get("implicit", []))
-
             if err:
-                graph.append({"file": file, "error": err, "depth": depth, "dependencies": []})
+                graph.append({"file": used_path, "error": err, "depth": depth, "dependencies": []})
                 continue
 
-            dep_paths: List[str] = [d["path"] for d in deps]
+            dep_paths: List[str] = []
+            for d in deps:
+                raw = d.get("path") or ""
+                clean = _normalize_dep_path(raw)
+                if _should_skip_dep_path(clean):
+                    continue
+                dep_paths.append(clean)
+
             graph.append({
-                "file": file,
+                "file": used_path,
                 "depth": depth,
                 "dependencies": dep_paths,
                 "error": None
@@ -609,29 +549,70 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
     }
 
 # ------------------------------------------------------------
-# INTERNAL: analyze a single file for /report
+# INTERNAL: analyze a single file (with targeted 404 reclass on /file)
 # ------------------------------------------------------------
-async def _analyze_single_file(path: str, ref: Optional[str], used_ref: str) -> Dict[str, Any]:
+async def _file_with_reclass(path: str, ref: Optional[str]) -> Dict[str, Any]:
     """
-    Fetches content (/file) and direct analysis (/deps) for a single path.
-    Returns a compact dict used by /report aggregation.
-    Applies reclassification retries and normalization.
+    Try /file; if 404 and looks like Tables/<Type|Ax*>.xpo, retry as Classes/<Symbol>.xpo
+    Returns: dict(content, sha, ref, used_path)
     """
-    # Try to fetch file first (for sha/content_len)
     try:
-        file_res = await file_get(path=path, ref=ref)  # type: ignore
-    except Exception as e:
-        file_res = {"sha": None, "content": "", "ref": used_ref}
-        file_err = f"file_get: {e}"
-    else:
-        file_err = None
+        fr = await file_get(path=path, ref=ref)  # type: ignore
+        return {"used_path": path, **fr}
+    except HTTPException as e:
+        if e.status_code != 404:
+            raise
+        m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", path)
+        if not m:
+            raise
+        folder, symbol = m.group(1), m.group(2)
+        if folder != "Tables":
+            raise
+        if not _is_candidate_symbol(symbol) or _looks_like_edt_name(symbol):
+            raise
+        if not (symbol.endswith("Type") or symbol.startswith("Ax")):
+            raise
+        alt = f"Classes/{symbol}.xpo"
+        fr = await file_get(path=alt, ref=ref)  # may raise
+        return {"used_path": alt, **fr}
 
-    # Now run deps with retries/normalization
-    node = await _safe_deps_normalized(path, used_ref)
+async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
+    """
+    Fetches content (/file with reclass) and direct analysis (/deps with reclass) for a single path.
+    Returns a compact dict used by /report aggregation.
+    """
+    try:
+        file_res = await _file_with_reclass(path, ref)
+    except Exception as e:
+        return {"path": path, "ref": ref, "error": f"file_get: {e}"}
+
+    used_path = file_res.get("used_path", path)
+
+    try:
+        deps_res_wrap = await _deps_with_reclass(used_path, ref or "main")
+        deps_res = {
+            "ref": ref,
+            "sha": None,
+            "dependencies": deps_res_wrap.get("deps") or [],
+            "business_rules": deps_res_wrap.get("business") or [],
+            "implicit_crud": deps_res_wrap.get("implicit") or [],
+            "invocations": deps_res_wrap.get("invocations") or [],
+            "error": deps_res_wrap.get("error")
+        }
+    except Exception as e:
+        deps_res = {
+            "ref": ref,
+            "sha": None,
+            "dependencies": [],
+            "business_rules": [],
+            "implicit_crud": [],
+            "invocations": [],
+            "error": f"deps_get: {e}"
+        }
 
     # Normalize and filter dependencies (defense in depth)
     norm_deps: List[Dict[str, Any]] = []
-    for d in node.get("deps", []) or []:
+    for d in deps_res.get("dependencies", []):
         raw = d.get("path") or ""
         clean = _normalize_dep_path(raw)
         if _should_skip_dep_path(clean):
@@ -640,16 +621,22 @@ async def _analyze_single_file(path: str, ref: Optional[str], used_ref: str) -> 
         nd["path"] = clean
         norm_deps.append(nd)
 
+    content_len = 0
+    try:
+        content_len = len(file_res.get("content", ""))
+    except Exception:
+        pass
+
     return {
-        "path": path,
-        "ref": node.get("ref", used_ref),
+        "path": used_path,
+        "ref": deps_res.get("ref", ref),
         "sha": file_res.get("sha"),
-        "content_len": len(file_res.get("content", "")),
+        "content_len": content_len,
         "dependencies": norm_deps,
-        "business_rules": node.get("business", []),
-        "implicit_crud": node.get("implicit", []),
-        "invocation_paths": node.get("invocations", []),
-        "error": file_err or node.get("error"),
+        "business_rules": deps_res.get("business_rules", []),
+        "implicit_crud": deps_res.get("implicit_crud", []),
+        "invocations": deps_res.get("invocations", []),
+        "error": deps_res.get("error"),
     }
 
 # ------------------------------------------------------------
@@ -660,8 +647,8 @@ async def _analyze_single_file(path: str, ref: Optional[str], used_ref: str) -> 
 async def report_post(payload: Dict[str, Any] = Body(...)):
     """
     Full transitive analysis in one call:
-      1) resolve -> full visited set (depth <= max_depth)  [with reclass + filtering]
-      2) analyze each visited file -> (/file + /deps)      [with reclass + filtering]
+      1) resolve -> full visited set (depth <= max_depth) with targeted reclass
+      2) analyze each visited file -> (/file + /deps) with targeted reclass
       3) merge into a single report payload
 
     Body:
@@ -682,7 +669,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     max_depth = int(payload.get("max_depth", 5))
     max_conc = int(payload.get("max_concurrency", int(os.getenv("MAX_CONCURRENCY", "8"))))
 
-    # --------- 1) internal resolve with reclassification ----------
+    # --------- 1) internal resolve ----------
     visited: Set[str] = set()
     graph: List[Dict[str, Any]] = []
     implicit_all: List[Dict[str, Any]] = []
@@ -692,21 +679,26 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     while current_level and depth < max_depth:
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
-
-        results = await asyncio.gather(*[_safe_deps_normalized(f, used_ref) for f in level_files])
+        results = await asyncio.gather(*[_deps_with_reclass(f, used_ref) for f in level_files])
 
         next_level: List[str] = []
         for res in results:
-            file = res["file"]
+            used_path = res.get("used_path") or res.get("file")
             err = res.get("error")
             deps = res.get("deps") or []
             implicit_all.extend(res.get("implicit", []))
             if err:
-                graph.append({"file": file, "depth": depth, "dependencies": [], "error": err})
+                graph.append({"file": used_path, "depth": depth, "dependencies": [], "error": err})
                 continue
 
-            dep_paths: List[str] = [d["path"] for d in deps]
-            graph.append({"file": file, "depth": depth, "dependencies": dep_paths, "error": None})
+            dep_paths: List[str] = []
+            for d in deps:
+                clean = _normalize_dep_path(d.get("path") or "")
+                if _should_skip_dep_path(clean):
+                    continue
+                dep_paths.append(clean)
+
+            graph.append({"file": used_path, "depth": depth, "dependencies": dep_paths, "error": None})
             next_level.extend(dep_paths)
 
         depth += 1
@@ -718,7 +710,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     sem = Semaphore(max_conc)
     async def _guarded_analyze(p: str):
         async with sem:
-            return await _analyze_single_file(p, used_ref, used_ref)
+            return await _analyze_single_file(p, used_ref)
 
     analyses = await asyncio.gather(*[_guarded_analyze(p) for p in visited_list])
 
@@ -727,7 +719,6 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     edges: List[Dict[str, Any]] = []
     business_rules_all: List[Dict[str, Any]] = []
     implicit_crud_all: List[Dict[str, Any]] = list(implicit_all)
-    invocation_all: List[Dict[str, Any]] = []
 
     depth_index = {g["file"]: g["depth"] for g in graph}
     for a in analyses:
@@ -748,7 +739,6 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
             })
         business_rules_all.extend(a.get("business_rules", []) or [])
         implicit_crud_all.extend(a.get("implicit_crud", []) or [])
-        invocation_all.extend(a.get("invocation_paths", []) or [])
 
     # dedupe edges
     seen = set()
@@ -771,6 +761,5 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         "edges": dedup_edges,
         "business_rules": business_rules_all,
         "implicit_crud": implicit_crud_all,
-        "invocation_paths": invocation_all,
         "status": "complete"
     }
