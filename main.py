@@ -1,13 +1,17 @@
-import os, base64, re, json, logging, asyncio
+import os, base64, re, json, logging, asyncio, time
 from typing import Dict, Any, List, Set, Optional
-from fastapi import FastAPI, HTTPException, Query, Body
-from fastapi.middleware.cors import CORSMiddleware
+from functools import lru_cache
+from contextlib import asynccontextmanager
+
 import httpx
+from fastapi import FastAPI, HTTPException, Query, Body, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.1.0")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,16 +44,35 @@ def get_env() -> Dict[str, str]:
 
 def ado_headers(pat: str) -> Dict[str, str]:
     # Azure DevOps requires a non-empty username for PAT auth
+    # (username can be anything non-empty). Keep existing behavior.
     basic = base64.b64encode(f"pat:{pat}".encode()).decode()
     return {
         "Authorization": f"Basic {basic}",
         "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
-        "User-Agent": "ado-git-crawler/1.0",
+        "User-Agent": "ado-git-crawler/1.2",
     }
 
 def ado_base(env: Dict[str, str]) -> str:
     return f"https://dev.azure.com/{env['ORG']}/{env['PROJECT']}/_apis/git/repositories/{env['REPO']}"
+
+# ------------------------------------------------------------
+# GLOBAL EXCEPTION HANDLER (guarantee JSON for Agent)
+# ------------------------------------------------------------
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    log.exception("Unhandled exception")
+    # If it's an HTTPException, FastAPI already handled formatting; this is a final safety net.
+    return JSONResponse(status_code=500, content={"error": "internal_error", "message": str(exc)[:300]})
+
+# ------------------------------------------------------------
+# SHARED HTTPX CLIENT (no redirects; faster via connection reuse)
+# ------------------------------------------------------------
+@asynccontextmanager
+async def shared_client(timeout=60):
+    # follow_redirects=False so we can detect ADO auth redirects or HTML pages
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        yield client
 
 # ------------------------------------------------------------
 # HEALTH CHECK
@@ -80,11 +103,12 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 
     log.info(f"[get_item_content] path={params['path']} ref={used_ref}")
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with shared_client(timeout=60) as client:
         r = await client.get(url, headers=ado_headers(env["PAT"]), params=params)
 
-        # Guard against HTML login redirects
-        if r.status_code == 302 or "text/html" in r.headers.get("content-type", ""):
+        # Guard against redirects and HTML (login or proxy pages)
+        ctype = r.headers.get("content-type", "")
+        if r.status_code in (301, 302, 303, 307, 308) or "text/html" in ctype:
             raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
 
         if r.status_code == 404:
@@ -204,8 +228,8 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     if is_form:
         ds_tables: Set[str] = set()
         for p in FORM_DS_PATTERNS:
-            for m in re.finditer(p, content, re.IGNORECASE):
-                sym = m.group(1)
+            for mm in re.finditer(p, content, re.IGNORECASE):
+                sym = mm.group(1)
                 if not sym:
                     continue
                 if sym in KERNEL_SKIP or len(sym) < 3:
@@ -423,45 +447,61 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
     }
 
 # ------------------------------------------------------------
-# ENDPOINT: /report (resolve + analyze every visited file)
+# /report with deadline, summary mode, caching, breadth caps, trims
 # ------------------------------------------------------------
+class _ReqScopeCache:
+    def __init__(self):
+        self.file_json: Dict[tuple, Dict[str, Any]] = {}   # (path, ref) → file_get() result
+        self.deps_json: Dict[tuple, Dict[str, Any]] = {}   # (file, ref) → deps_get() result
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _deadline_expired(deadline_ms: int) -> bool:
+    return _now_ms() >= deadline_ms
+
+def _time_left(deadline_ms: int) -> int:
+    return max(0, deadline_ms - _now_ms())
+
 from asyncio import Semaphore
 
-async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
-    """
-    Fetches content (/file) and direct analysis (/deps) for a single path.
-    Returns a compact dict used by /report aggregation.
-    """
+async def _analyze_single_file(path: str, ref: Optional[str], file_get_fn, deps_get_fn, deadline_ms: int) -> Dict[str, Any]:
+    if _deadline_expired(deadline_ms):
+        return {"path": path, "ref": ref, "error": "deadline_exceeded"}
     try:
-        file_res = await file_get(path=path, ref=ref)  # type: ignore
+        file_res = await file_get_fn(path=path, ref=ref)
     except Exception as e:
         return {"path": path, "ref": ref, "error": f"file_get: {e}"}
 
     try:
-        deps_res = await deps_get(file=path, ref=ref, page=1, limit=200)  # type: ignore
+        deps_res = await deps_get_fn(file=path, ref=ref)
     except Exception as e:
         return {
-            "path": path, "ref": ref, "sha": file_res.get("sha"),
+            "path": path, "ref": ref,
+            "sha": file_res.get("sha"),
             "content_len": len(file_res.get("content", "")),
             "dependencies": [], "business_rules": [], "implicit_crud": [],
             "error": f"deps_get: {e}"
         }
 
-    # Normalize and filter dependencies (defense in depth)
+    # Normalize + filter deps (defense in depth)
     norm_deps: List[Dict[str, Any]] = []
-    for d in deps_res.get("dependencies", []):
-        raw = d.get("path") or ""
-        clean = _normalize_dep_path(raw)
+    for d in deps_res.get("dependencies", []) or []:
+        clean = _normalize_dep_path(d.get("path") or "")
         if _should_skip_dep_path(clean):
             continue
         nd = dict(d)
         nd["path"] = clean
         norm_deps.append(nd)
 
+    # Trim near-deadline
+    if _time_left(deadline_ms) < 5000 and len(norm_deps) > 200:
+        norm_deps = norm_deps[:200]
+
     return {
         "path": path,
         "ref": deps_res.get("ref", ref),
-        "sha": deps_res.get("sha") or file_res.get("sha"),
+        "sha": deps_res.get("sha") or file_res.get("sha", "unknown"),
         "content_len": len(file_res.get("content", "")),
         "dependencies": norm_deps,
         "business_rules": deps_res.get("business_rules", []),
@@ -473,61 +513,104 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
 @app.post("/report/")
 async def report_post(payload: Dict[str, Any] = Body(...)):
     """
-    Full transitive analysis in one call:
-      1) resolve -> full visited set (depth <= max_depth)
-      2) analyze each visited file -> (/file + /deps)
-      3) merge into a single report payload
+    Full transitive analysis in one call with a hard deadline and summary mode.
 
     Body:
     {
       "start_file": "Forms/mssBDAckTableFurn.xpo",
       "ref": "main",
       "max_depth": 5,
-      "max_concurrency": 8   # optional
+      "max_concurrency": 8,
+      "timeout_ms": 110000,          # optional total deadline (default ~110s)
+      "mode": "full" | "summary",    # summary returns counts + top-N
+      "level_cap": 400,              # max nodes expanded per depth level
+      "top_n": 200                   # summary mode: how many items to include
     }
     """
     env = get_env()
     start_file: str = payload.get("start_file")
     if not start_file:
         raise HTTPException(400, "Missing required field: start_file")
+
     used_ref = payload.get("ref") or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
-    max_depth = int(payload.get("max_depth", 5))
-    max_conc = int(payload.get("max_concurrency", int(os.getenv("MAX_CONCURRENCY", "8"))))
 
-    # --------- 1) internal resolve (reuse resolve_post logic without HTTP hop) ----------
+    # Limits / defaults
+    max_depth = int(payload.get("max_depth", 5))
+    max_depth = max(1, min(max_depth, 10))
+
+    max_conc = int(payload.get("max_concurrency", int(os.getenv("MAX_CONCURRENCY", "8"))))
+    max_conc = max(1, min(max_conc, 16))
+
+    timeout_ms = int(payload.get("timeout_ms", int(os.getenv("REPORT_TIMEOUT_MS", "110000"))))
+    deadline = _now_ms() + timeout_ms
+
+    mode = (payload.get("mode") or "full").lower()
+    level_cap = int(payload.get("level_cap", int(os.getenv("LEVEL_CAP", "400"))))
+    top_n = int(payload.get("top_n", int(os.getenv("SUMMARY_TOP_N", "200"))))
+
+    # Hard caps for runaway graphs
+    MAX_VISITED = int(os.getenv("MAX_VISITED", "1500"))
+    MAX_EDGES   = int(os.getenv("MAX_EDGES",   "12000"))
+    MAX_RULES   = int(os.getenv("MAX_RULES",   "5000"))
+
+    # --------- per-request caches to reduce ADO calls ----------
+    scope = _ReqScopeCache()
+
+    async def file_get_cached(path: str, ref: Optional[str]):
+        key = (path, ref or used_ref)
+        if key in scope.file_json:
+            return scope.file_json[key]
+        res = await file_get(path=path, ref=ref)  # type: ignore
+        scope.file_json[key] = res
+        return res
+
+    async def deps_get_cached(file: str, ref: Optional[str]):
+        key = (file, ref or used_ref)
+        if key in scope.deps_json:
+            return scope.deps_json[key]
+        res = await deps_get(file=file, ref=ref, page=1, limit=200)  # type: ignore
+        scope.deps_json[key] = res
+        return res
+
+    # --------- 1) internal resolve (bounded, deadline-aware) ----------
     visited: Set[str] = set()
     graph: List[Dict[str, Any]] = []
     implicit_all: List[Dict[str, Any]] = []
     current_level: List[str] = [start_file]
     depth = 0
+    overflow = False
 
     async def safe_deps(file: str):
         try:
-            node = await deps_get(file=file, ref=used_ref, page=1, limit=200)  # type: ignore
+            node = await deps_get_cached(file=file, ref=used_ref)
             implicit_all.extend(node.get("implicit_crud", []))
             return {"file": file, "deps": node.get("dependencies", []), "error": None}
         except Exception as e:
-            log.error(f"[report] Failed deps_get for {file}: {e}")
+            log.error(f"[report] deps_get failed for {file}: {e}")
             return {"file": file, "deps": None, "error": str(e)}
 
-    while current_level and depth < max_depth:
+    while current_level and depth < max_depth and not _deadline_expired(deadline):
+        # breadth cap per level to avoid explosion
+        if len(current_level) > level_cap:
+            current_level = current_level[:level_cap]
+            overflow = True
+
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
-        results = await asyncio.gather(*[safe_deps(f) for f in level_files])
 
+        results = await asyncio.gather(*[safe_deps(f) for f in level_files])
         next_level: List[str] = []
+
         for res in results:
             file = res["file"]
-            err = res.get("error")
-            deps = res.get("deps") or []
-            if err:
-                graph.append({"file": file, "depth": depth, "dependencies": [], "error": err})
+            if res.get("error"):
+                graph.append({"file": file, "depth": depth, "dependencies": [], "error": res["error"]})
                 continue
 
             dep_paths: List[str] = []
-            for d in deps:
+            for d in (res.get("deps") or []):
                 clean = _normalize_dep_path(d.get("path") or "")
                 if _should_skip_dep_path(clean):
                     continue
@@ -537,17 +620,30 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
             next_level.extend(dep_paths)
 
         depth += 1
-        current_level = [f for f in set(next_level) if f not in visited]
+        if len(visited) >= MAX_VISITED:
+            overflow = True
+            break
+
+        # unique and remove already visited
+        current_level = [f for f in dict.fromkeys(next_level) if f not in visited]
 
     visited_list = sorted(list(visited))
 
-    # --------- 2) analyze each visited file with bounded concurrency ----------
+    # --------- 2) analyze (bounded concurrency, deadline-aware) ----------
     sem = Semaphore(max_conc)
-    async def _guarded_analyze(p: str):
-        async with sem:
-            return await _analyze_single_file(p, used_ref)
 
-    analyses = await asyncio.gather(*[_guarded_analyze(p) for p in visited_list])
+    async def _guarded_analyze(p: str):
+        if _deadline_expired(deadline):
+            return {"path": p, "ref": used_ref, "error": "deadline_exceeded"}
+        async with sem:
+            return await _analyze_single_file(p, used_ref, file_get_cached, deps_get_cached, deadline)
+
+    if mode == "summary" and len(visited_list) > top_n:
+        sample = visited_list[:top_n]
+        analyses = await asyncio.gather(*[_guarded_analyze(p) for p in sample])
+        overflow = True
+    else:
+        analyses = await asyncio.gather(*[_guarded_analyze(p) for p in visited_list])
 
     # --------- 3) merge into objects/edges/rules ----------
     objects: List[Dict[str, Any]] = []
@@ -575,7 +671,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         business_rules_all.extend(a.get("business_rules", []) or [])
         implicit_crud_all.extend(a.get("implicit_crud", []) or [])
 
-    # dedupe edges
+    # de-dupe edges
     seen = set()
     dedup_edges = []
     for e in edges:
@@ -585,16 +681,35 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         seen.add(key)
         dedup_edges.append(e)
 
+    # hard trims for oversized
+    trimmed = False
+    if len(dedup_edges) > MAX_EDGES:
+        dedup_edges = dedup_edges[:MAX_EDGES]
+        trimmed = True
+    if len(business_rules_all) > MAX_RULES:
+        business_rules_all = business_rules_all[:MAX_RULES]
+        trimmed = True
+
+    status_parts = []
+    if overflow:
+        status_parts.append("partial: breadth capped")
+    if trimmed:
+        status_parts.append("partial: payload trimmed")
+    if _deadline_expired(deadline):
+        status_parts.append("partial: deadline exceeded")
+    if not status_parts:
+        status_parts.append("complete")
+
     return {
         "root": start_file,
         "ref": used_ref,
         "max_depth": max_depth,
         "depth_completed": depth,
-        "visited": visited_list,
-        "graph": graph,
-        "objects": objects,
-        "edges": dedup_edges,
-        "business_rules": business_rules_all,
-        "implicit_crud": implicit_crud_all,
-        "status": "complete"
+        "visited": visited_list if mode == "full" else visited_list[:top_n],
+        "graph": graph if mode == "full" else graph[:top_n],
+        "objects": objects if mode == "full" else objects[:top_n],
+        "edges": dedup_edges if mode == "full" else dedup_edges[:top_n],
+        "business_rules": business_rules_all if mode == "full" else business_rules_all[:top_n],
+        "implicit_crud": implicit_crud_all if mode == "full" else implicit_crud_all[:top_n],
+        "status": " ; ".join(status_parts)
     }
