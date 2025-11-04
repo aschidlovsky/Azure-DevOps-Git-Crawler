@@ -7,7 +7,7 @@ import httpx
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.2")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,11 +39,10 @@ def get_env() -> Dict[str, str]:
     }
 
 def ado_headers(pat: str) -> Dict[str, str]:
-    # Azure DevOps requires a non-empty username for PAT-based auth
     basic = base64.b64encode(f"pat:{pat}".encode()).decode()
     return {
         "Authorization": f"Basic {basic}",
-        "X-TFS-FedAuthRedirect": "Suppress",  # avoid login redirects
+        "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
         "User-Agent": "ado-git-crawler/1.0",
     }
@@ -60,19 +59,14 @@ async def health():
     return {"status": "ok"}
 
 # ------------------------------------------------------------
-# FETCH FILE CONTENT FROM ADO  (HEAD -> DEFAULT_REF normalization)
+# FETCH FILE CONTENT FROM ADO (HEAD normalization)
 # ------------------------------------------------------------
 async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     env = get_env()
     base = ado_base(env)
-
-    # Normalize ref; Copilot often passes HEAD — use DEFAULT_REF instead
     used_ref = ref or env["REF"]
     if isinstance(used_ref, str) and used_ref.upper() == "HEAD":
         used_ref = env["REF"]
-
-    # Optional: if you set DEFAULT_REF to "Main" (capital M), keep it exactly
-    # as configured in your Railway env var. ADO branch names are case-sensitive.
 
     params = {
         "path": f"/{path}" if not path.startswith("/") else path,
@@ -82,18 +76,15 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     }
     url = f"{base}/items"
 
-    # Debug log so you can verify what branch is actually used
     log.info(f"[get_item_content] path={params['path']} ref={used_ref}")
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.get(url, headers=ado_headers(env["PAT"]), params=params)
 
-        # Guard against HTML login redirects
         if r.status_code == 302 or "text/html" in r.headers.get("content-type", ""):
             raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
 
         if r.status_code == 404:
-            # Show the exact ref we used to help diagnose branch mismatch
             raise HTTPException(404, f"File not found in ADO: {path}@{used_ref}")
 
         try:
@@ -104,13 +95,12 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         try:
             data = r.json()
         except Exception:
-            raise HTTPException(502, "Azure DevOps returned non-JSON content (likely auth redirect).")
+            raise HTTPException(502, "Azure DevOps returned non-JSON (likely auth redirect).")
 
         content = data.get("content")
         if not content:
             raise HTTPException(404, "No content found for this path (might be binary or empty).")
 
-        # Attempt base64 → text; if it's already text, decoding will no-op gracefully
         try:
             content = base64.b64decode(content).decode("utf-8")
         except Exception:
@@ -139,13 +129,21 @@ KERNEL_SKIP = {"FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildD
 def extract_dependencies(content: str) -> Dict[str, Any]:
     deps, implicit, business = [], [], []
 
+    TYPE_PATHS = {
+        "Table": "Tables",
+        "Class": "Classes",
+        "Form": "Forms",
+        "Map": "Maps",
+        "Unknown": "Unknown"
+    }
+
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
         for m in re.finditer(pattern, content, re.IGNORECASE):
             symbol = m.group(2) if reason == "statement" else m.group(1)
             if symbol in KERNEL_SKIP:
                 continue
             deps.append({
-                "path": f"{kind}s/{symbol}.xpo",
+                "path": f"{TYPE_PATHS.get(kind, 'Unknown')}/{symbol}.xpo",
                 "type": kind,
                 "symbol": symbol,
                 "reason": reason
@@ -178,7 +176,7 @@ async def file_get(
     return {"path": path, "ref": data["ref"], "sha": data["sha"], "content": data["content"]}
 
 # ------------------------------------------------------------
-# ENDPOINT: /deps (single-hop)
+# ENDPOINT: /deps
 # ------------------------------------------------------------
 @app.get("/deps")
 @app.get("/deps/")
@@ -204,7 +202,7 @@ async def deps_get(
         "dependencies": paged,
         "business_rules": parsed["business_rules"],
         "implicit_crud": parsed["implicit_crud"],
-        "unresolved": [d for d in parsed["dependencies"] if not os.path.exists(d["path"])],
+        "unresolved": [],
         "visited": [file],
         "skipped": [],
         "page": page,
@@ -267,7 +265,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
             dep_paths: List[str] = []
             for d in deps:
                 raw = d.get("path") or ""
-                # Normalize "lcl" prefix (including 'lclmss' variants) but keep 'mss'
+                # Normalize lcl/lclmss prefix but keep mss
                 clean = re.sub(
                     r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
                     lambda m: f"{m.group(1)}{(m.group(3) or '')}{m.group(4)}",
