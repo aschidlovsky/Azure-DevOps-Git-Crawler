@@ -219,39 +219,89 @@ async def deps_get(
 async def resolve_post(payload: Dict[str, Any] = Body(...)):
     """
     Recursively resolves dependencies up to max_depth.
-    For each dependency discovered, fetches its dependencies automatically.
+    Options:
+      - ref: override branch/ref (HEAD auto-normalized to DEFAULT_REF)
+      - include_content: include raw .xpo content for each visited file
+      - verify_paths: probe ADO before recursing to avoid 404 branches
     """
-    start_file = payload["start_file"]
-    max_depth = int(payload.get("max_depth", 5))
-    used_ref = payload.get("ref", "main")
+    start_file: str = payload["start_file"]
+    max_depth: int = int(payload.get("max_depth", 5))
+    req_ref: Optional[str] = payload.get("ref")
+    include_content: bool = bool(payload.get("include_content", False))
+    verify_paths: bool = bool(payload.get("verify_paths", False))
+
+    # Normalize ref like we do elsewhere
+    env = get_env()
+    used_ref = (req_ref or env["REF"])
+    if str(used_ref).upper() == "HEAD":
+        used_ref = env["REF"]
 
     visited: Set[str] = set()
     graph: List[Dict[str, Any]] = []
     implicit_all: List[Dict[str, Any]] = []
 
+    async def enqueue_node(file: str, depth: int, deps: Optional[List[Dict[str, Any]]], error: Optional[str]):
+        node: Dict[str, Any] = {
+            "file": file,
+            "depth": depth,
+            "error": error,
+            "dependencies": None if deps is None else [d["path"] for d in deps],
+        }
+        # Optional: include content for this node
+        if include_content and error is None:
+            try:
+                content_obj = await get_item_content(file, used_ref)
+                node["ref"] = content_obj["ref"]
+                node["sha"] = content_obj["sha"]
+                node["content"] = content_obj["content"]
+            except Exception as e:
+                node["content_error"] = str(e)
+        graph.append(node)
+
     async def crawl(file: str, depth: int):
-        if depth > max_depth or file in visited:
+        if depth > max_depth:
+            return
+        if file in visited:
+            log.info(f"[resolve] SKIP (visited) {file} @depth {depth}")
             return
         visited.add(file)
+
         try:
+            # Run deps_get internally (fast, no HTTP hop)
+            log.info(f"[resolve] deps_get → {file} @depth {depth} ref={used_ref}")
             node = await deps_get(file=file, ref=used_ref, page=1, limit=200)  # type: ignore
             deps = node["dependencies"]
             implicit_all.extend(node["implicit_crud"])
-            graph.append({"file": file, "dependencies": [d["path"] for d in deps], "error": None})
+            await enqueue_node(file, depth, deps, None)
+
+            # Optionally verify target paths before recursing
             for d in deps:
-                await crawl(d["path"], depth + 1)
+                target = d["path"]
+                if target in visited:
+                    continue
+                if verify_paths:
+                    try:
+                        # quick existence probe
+                        await get_item_content(target, used_ref)
+                    except Exception as e:
+                        log.info(f"[resolve] verify_paths FAIL {target} → {e}")
+                        await enqueue_node(target, depth + 1, None, str(e))
+                        continue
+                await crawl(target, depth + 1)
+
         except Exception as e:
-            graph.append({"file": file, "error": str(e), "dependencies": None})
+            log.info(f"[resolve] ERROR {file} @depth {depth}: {e}")
+            await enqueue_node(file, depth, None, str(e))
 
     await crawl(start_file, 0)
 
     return {
         "root": start_file,
+        "ref": used_ref,
         "depth": max_depth,
-        "graph": graph,
-        "implicit_crud": implicit_all,
-        "visited": sorted(list(visited)),
         "total_files": len(visited),
-        "skipped": [],
-        "status": "complete"
+        "visited": sorted(list(visited)),
+        "implicit_crud": implicit_all,
+        "graph": graph,
+        "status": "complete",
     }
