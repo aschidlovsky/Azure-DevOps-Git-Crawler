@@ -7,7 +7,7 @@ import httpx
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.4")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -200,6 +200,37 @@ def extract_dependencies(content: str) -> Dict[str, Any]:
     return {"dependencies": deps, "implicit_crud": implicit, "business_rules": business}
 
 # ------------------------------------------------------------
+# FOLLOW-ON FILTERING FOR /resolve (re-applies skip rules every hop)
+# ------------------------------------------------------------
+ALLOWED_FOLDERS = {"Tables", "Classes", "Forms", "Maps"}
+
+def _should_skip_dep_path(p: str) -> bool:
+    """
+    Returns True if this normalized path should be ignored (kernel/system/junk).
+    Expects something like 'Tables/PurchLine.xpo'.
+    """
+    if not p or ".xpo" not in p:
+        return True
+    m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", p)
+    if not m:
+        return True
+    folder, symbol = m.group(1), m.group(2)
+    if folder not in ALLOWED_FOLDERS:
+        return True
+    # reuse global KERNEL_SKIP
+    if symbol in KERNEL_SKIP:
+        return True
+    # defensive lowercasing for common keywords that might not be cased as in KERNEL_SKIP
+    if symbol.lower() in {
+        "sum","avg","min","max","count","len","is","the","for","select","firstonly",
+        "exists","update_recordset","delete_from","insert_recordset","this","super"
+    }:
+        return True
+    if len(symbol) < 3:
+        return True
+    return False
+
+# ------------------------------------------------------------
 # ENDPOINT: /file
 # ------------------------------------------------------------
 @app.get("/file")
@@ -316,6 +347,9 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
                     lambda m: f"{m.group(1)}{(m.group(3) or '')}{m.group(4)}",
                     raw,
                 )
+                # Re-filter at every hop to prevent junk propagation
+                if _should_skip_dep_path(clean):
+                    continue
                 dep_paths.append(clean)
 
             graph.append({
