@@ -7,7 +7,7 @@ import httpx
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.3")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,10 +39,11 @@ def get_env() -> Dict[str, str]:
     }
 
 def ado_headers(pat: str) -> Dict[str, str]:
+    # Azure DevOps requires a non-empty username for PAT-based auth
     basic = base64.b64encode(f"pat:{pat}".encode()).decode()
     return {
         "Authorization": f"Basic {basic}",
-        "X-TFS-FedAuthRedirect": "Suppress",
+        "X-TFS-FedAuthRedirect": "Suppress",  # avoid login redirects
         "Accept": "application/json",
         "User-Agent": "ado-git-crawler/1.0",
     }
@@ -59,11 +60,13 @@ async def health():
     return {"status": "ok"}
 
 # ------------------------------------------------------------
-# FETCH FILE CONTENT FROM ADO (HEAD normalization)
+# FETCH FILE CONTENT FROM ADO (HEAD -> DEFAULT_REF normalization)
 # ------------------------------------------------------------
 async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     env = get_env()
     base = ado_base(env)
+
+    # Normalize ref; Copilot often passes HEAD — use DEFAULT_REF instead
     used_ref = ref or env["REF"]
     if isinstance(used_ref, str) and used_ref.upper() == "HEAD":
         used_ref = env["REF"]
@@ -81,6 +84,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.get(url, headers=ado_headers(env["PAT"]), params=params)
 
+        # Guard against HTML login redirects
         if r.status_code == 302 or "text/html" in r.headers.get("content-type", ""):
             raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
 
@@ -95,12 +99,13 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         try:
             data = r.json()
         except Exception:
-            raise HTTPException(502, "Azure DevOps returned non-JSON (likely auth redirect).")
+            raise HTTPException(502, "Azure DevOps returned non-JSON content (likely auth redirect or proxy page).")
 
         content = data.get("content")
         if not content:
             raise HTTPException(404, "No content found for this path (might be binary or empty).")
 
+        # Attempt base64 → text; if already text, decoding will no-op
         try:
             content = base64.b64decode(content).decode("utf-8")
         except Exception:
@@ -113,7 +118,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         }
 
 # ------------------------------------------------------------
-# LIGHTWEIGHT PARSER
+# LIGHTWEIGHT PARSER (with kernel/system filtering)
 # ------------------------------------------------------------
 DEPENDENCY_PATTERNS = [
     (r"\b(select|insert|update|delete)\s+(\w+)", "Table", "statement"),
@@ -123,25 +128,52 @@ DEPENDENCY_PATTERNS = [
     (r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", "Table", "crud-call"),
 ]
 
-CRUD_SIGNATURE = re.compile(r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", re.IGNORECASE)
-KERNEL_SKIP = {"FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase"}
+CRUD_SIGNATURE = re.compile(
+    r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", re.IGNORECASE
+)
+
+# Expanded kernel/system skip list — prevents junk like 'sum', 'firstOnly', etc.
+KERNEL_SKIP = {
+    # AX kernel/system classes/tables/utilities
+    "FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase",
+    "Map", "List", "Array", "Tmp", "TmpTable", "Info", "Error", "Warning",
+    "Query", "QueryRun", "SysQuery", "SysTable", "SysDictTable", "SysDictField",
+    "TableId", "DataAreaId", "Company",
+    # Common identifiers / false positives
+    "RecId", "t", "x", "y", "z", "this", "super",
+    # X++ keywords / tokens often captured by statement regex
+    "sum", "avg", "min", "max", "count", "len", "is", "the", "for", "select", "firstOnly",
+    "exists", "update_recordset", "delete_from", "insert_recordset"
+}
+
+TYPE_PATHS = {
+    "Table": "Tables",
+    "Class": "Classes",
+    "Form": "Forms",
+    "Map": "Maps",
+    "Unknown": "Unknown"
+}
 
 def extract_dependencies(content: str) -> Dict[str, Any]:
-    deps, implicit, business = [], [], []
+    deps: List[Dict[str, Any]] = []
+    implicit: List[Dict[str, Any]] = []
+    business: List[Dict[str, Any]] = []
 
-    TYPE_PATHS = {
-        "Table": "Tables",
-        "Class": "Classes",
-        "Form": "Forms",
-        "Map": "Maps",
-        "Unknown": "Unknown"
-    }
-
+    # Direct dependency detection
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
         for m in re.finditer(pattern, content, re.IGNORECASE):
             symbol = m.group(2) if reason == "statement" else m.group(1)
+            if not symbol:
+                continue
+
+            # Filter out system/kernel names and common false positives
             if symbol in KERNEL_SKIP:
                 continue
+
+            # Skip 1–2 char names (usually false positives like "t", "x")
+            if len(symbol) < 3:
+                continue
+
             deps.append({
                 "path": f"{TYPE_PATHS.get(kind, 'Unknown')}/{symbol}.xpo",
                 "type": kind,
@@ -149,14 +181,18 @@ def extract_dependencies(content: str) -> Dict[str, Any]:
                 "reason": reason
             })
 
+    # Implicit CRUD calls
     for m in CRUD_SIGNATURE.finditer(content):
-        implicit.append({
-            "table": m.group(1),
-            "method": m.group(2) + "()",
-            "caller": "unknown",
-            "line": m.start()
-        })
+        table_sym = m.group(1)
+        if table_sym and table_sym not in KERNEL_SKIP:
+            implicit.append({
+                "table": table_sym,
+                "method": m.group(2) + "()",
+                "caller": "unknown",
+                "line": m.start()
+            })
 
+    # Business-rule signals (lightweight)
     for ln, line in enumerate(content.splitlines(), start=1):
         if any(k in line for k in ["validate", "error(", "ttsBegin", "ttsCommit"]):
             business.append({"line": ln, "context": line.strip()[:160]})
@@ -176,7 +212,7 @@ async def file_get(
     return {"path": path, "ref": data["ref"], "sha": data["sha"], "content": data["content"]}
 
 # ------------------------------------------------------------
-# ENDPOINT: /deps
+# ENDPOINT: /deps (single-hop)
 # ------------------------------------------------------------
 @app.get("/deps")
 @app.get("/deps/")
@@ -202,7 +238,7 @@ async def deps_get(
         "dependencies": paged,
         "business_rules": parsed["business_rules"],
         "implicit_crud": parsed["implicit_crud"],
-        "unresolved": [],
+        "unresolved": [],  # unresolved is repo-resolved via ADO, not local FS
         "visited": [file],
         "skipped": [],
         "page": page,
@@ -219,7 +255,15 @@ async def deps_get(
 async def resolve_post(payload: Dict[str, Any] = Body(...)):
     """
     BFS recursion: expands dependencies up to max_depth internally.
-    Handles lcl/lclmss cleanup and gracefully skips failed nodes.
+    - Normalizes lcl/lclmss prefixes but preserves 'mss'
+    - Filters kernel/system noise so we don't chase junk symbols
+    - Handles errors per-node to avoid request-wide 500s
+    Body:
+      {
+        "start_file": "Forms/mssBDAckTableFurn.xpo",
+        "ref": "main",
+        "max_depth": 5
+      }
     """
     env = get_env()
     start_file: str = payload.get("start_file")
@@ -251,6 +295,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
 
+        # parallel fetch for this layer
         results = await asyncio.gather(*[safe_deps(f) for f in level_files])
 
         next_level: List[str] = []
@@ -265,13 +310,14 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
             dep_paths: List[str] = []
             for d in deps:
                 raw = d.get("path") or ""
-                # Normalize lcl/lclmss prefix but keep mss
+                # Normalize "lcl" prefix (including 'lclmss') but keep 'mss'
                 clean = re.sub(
                     r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
                     lambda m: f"{m.group(1)}{(m.group(3) or '')}{m.group(4)}",
                     raw,
                 )
                 dep_paths.append(clean)
+
             graph.append({
                 "file": file,
                 "depth": depth,
@@ -281,6 +327,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
             next_level.extend(dep_paths)
 
         depth += 1
+        # De-dupe and avoid revisits
         current_level = [f for f in set(next_level) if f not in visited]
 
     return {
