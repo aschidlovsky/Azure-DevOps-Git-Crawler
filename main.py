@@ -7,7 +7,7 @@ import httpx
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.3")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -117,16 +117,35 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 # ------------------------------------------------------------
 # LIGHTWEIGHT PARSER
 # ------------------------------------------------------------
+
+# Patterns for hints
 DEPENDENCY_PATTERNS = [
+    # Naive "verb + token" (we'll filter tokens)
     (r"\b(select|insert|update|delete)\s+(\w+)", "Table", "statement"),
+    # DataSource() often indicates a table buffer
     (r"\b(\w+)\.DataSource\(", "Table", "DataSource()"),
+    # Class usage
     (r"\b(\w+)::(construct|new|run)\b", "Class", "static-call"),
     (r"\bnew\s+(\w+)\s*\(", "Class", "new"),
+    # Explicit CRUD calls on a buffer/record
     (r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", "Table", "crud-call"),
 ]
 
 CRUD_SIGNATURE = re.compile(r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", re.IGNORECASE)
+
+# Framework/kernel and common noise tokens to skip
 KERNEL_SKIP = {"FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase"}
+STOPWORDS = {
+    # X++ select/where modifiers and noise
+    "forupdate", "firstonly", "firstfast", "nofetch", "index", "group", "order", "by", "asc", "desc",
+    "exists", "notexists", "outer", "join", "where", "like", "as", "from", "to", "cross", "container",
+    # common tokens and keywords
+    "this", "the", "super", "true", "false", "null", "element", "display", "edit",
+    # common field names / meta
+    "recid", "tableid", "fieldid",
+    # generic types that showed up as false positives
+    "map",  # we don't want "Classes/Map.xpo"
+}
 
 TYPE_DIR = {"Table": "Tables", "Class": "Classes", "Form": "Forms", "Map": "Maps"}
 
@@ -134,16 +153,34 @@ def default_path_for(symbol: str, kind: str) -> str:
     folder = TYPE_DIR.get(kind, "UNKNOWN")
     return f"{folder}/{symbol}.xpo"
 
+def is_noise_symbol(symbol: str) -> bool:
+    s = symbol.lower()
+    if s in STOPWORDS:
+        return True
+    # super short or generic tokens tend to be noise
+    if len(s) <= 2:
+        return True
+    return False
+
 def extract_dependencies(content: str) -> Dict[str, Any]:
-    deps, implicit, business = [], [], []
+    deps: List[Dict[str, Any]] = []
+    implicit: List[Dict[str, Any]] = []
+    business: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()  # (kind, symbol) to de-dupe
 
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
         for m in re.finditer(pattern, content, re.IGNORECASE):
             symbol = m.group(2) if reason == "statement" else m.group(1)
-            if symbol in KERNEL_SKIP:
+            if not symbol:
                 continue
+            if symbol in KERNEL_SKIP or is_noise_symbol(symbol):
+                continue
+            key = (kind, symbol)
+            if key in seen:
+                continue
+            seen.add(key)
             deps.append({
-                "path": default_path_for(symbol, kind),  # ← type-based path
+                "path": default_path_for(symbol, kind),  # type-based folder guess
                 "type": kind,
                 "symbol": symbol,
                 "reason": reason
@@ -197,7 +234,7 @@ async def deps_get(
         "dependencies": paged,
         "business_rules": parsed["business_rules"],
         "implicit_crud": parsed["implicit_crud"],
-        # still mark unresolved by folder prefix:
+        # If you later add ADO path probing, unresolved can be upgraded — for now we only mark UNKNOWN/
         "unresolved": [d for d in parsed["dependencies"] if d["path"].startswith("UNKNOWN/")],
         "visited": [file],
         "skipped": [],
