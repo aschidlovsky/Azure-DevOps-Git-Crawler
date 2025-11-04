@@ -7,7 +7,7 @@ import httpx
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.2")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,7 +65,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     env = get_env()
     base = ado_base(env)
 
-    # 🩹 Normalize HEAD → env default (avoids 404s)
+    # Normalize HEAD → env default
     used_ref = ref or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
@@ -81,7 +81,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.get(url, headers=ado_headers(env["PAT"]), params=params)
 
-        # Handle ADO login redirects or auth errors cleanly
+        # Auth/redirect guard
         if r.status_code == 302 or "text/html" in r.headers.get("content-type", ""):
             raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
 
@@ -96,12 +96,13 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         try:
             data = r.json()
         except Exception:
-            raise HTTPException(502, "Azure DevOps returned non-JSON content (likely auth redirect or proxy page).")
+            raise HTTPException(502, "Azure DevOps returned non-JSON content (likely auth redirect).")
 
         content = data.get("content")
         if not content:
             raise HTTPException(404, "No content found for this path (might be binary or empty).")
 
+        # Base64 → text if needed
         try:
             content = base64.b64decode(content).decode("utf-8")
         except Exception:
@@ -127,6 +128,12 @@ DEPENDENCY_PATTERNS = [
 CRUD_SIGNATURE = re.compile(r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", re.IGNORECASE)
 KERNEL_SKIP = {"FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase"}
 
+TYPE_DIR = {"Table": "Tables", "Class": "Classes", "Form": "Forms", "Map": "Maps"}
+
+def default_path_for(symbol: str, kind: str) -> str:
+    folder = TYPE_DIR.get(kind, "UNKNOWN")
+    return f"{folder}/{symbol}.xpo"
+
 def extract_dependencies(content: str) -> Dict[str, Any]:
     deps, implicit, business = [], [], []
 
@@ -135,7 +142,12 @@ def extract_dependencies(content: str) -> Dict[str, Any]:
             symbol = m.group(2) if reason == "statement" else m.group(1)
             if symbol in KERNEL_SKIP:
                 continue
-            deps.append({"path": f"UNKNOWN/{symbol}.xpo", "type": kind, "symbol": symbol, "reason": reason})
+            deps.append({
+                "path": default_path_for(symbol, kind),  # ← type-based path
+                "type": kind,
+                "symbol": symbol,
+                "reason": reason
+            })
 
     for m in CRUD_SIGNATURE.finditer(content):
         implicit.append({"table": m.group(1), "method": m.group(2) + "()", "caller": "unknown", "line": m.start()})
@@ -185,6 +197,7 @@ async def deps_get(
         "dependencies": paged,
         "business_rules": parsed["business_rules"],
         "implicit_crud": parsed["implicit_crud"],
+        # still mark unresolved by folder prefix:
         "unresolved": [d for d in parsed["dependencies"] if d["path"].startswith("UNKNOWN/")],
         "visited": [file],
         "skipped": [],
