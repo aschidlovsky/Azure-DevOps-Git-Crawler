@@ -60,27 +60,41 @@ async def health():
     return {"status": "ok"}
 
 # ------------------------------------------------------------
-# FETCH FILE CONTENT FROM ADO
+# FETCH FILE CONTENT FROM ADO  (HEAD -> DEFAULT_REF normalization)
 # ------------------------------------------------------------
 async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     env = get_env()
     base = ado_base(env)
+
+    # Normalize ref; Copilot often passes HEAD — use DEFAULT_REF instead
+    used_ref = ref or env["REF"]
+    if isinstance(used_ref, str) and used_ref.upper() == "HEAD":
+        used_ref = env["REF"]
+
+    # Optional: if you set DEFAULT_REF to "Main" (capital M), keep it exactly
+    # as configured in your Railway env var. ADO branch names are case-sensitive.
+
     params = {
         "path": f"/{path}" if not path.startswith("/") else path,
-        "versionDescriptor.version": ref or env["REF"],
+        "versionDescriptor.version": used_ref,
         "includeContent": "true",
         "api-version": env["API"],
     }
     url = f"{base}/items"
 
+    # Debug log so you can verify what branch is actually used
+    log.info(f"[get_item_content] path={params['path']} ref={used_ref}")
+
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.get(url, headers=ado_headers(env["PAT"]), params=params)
 
+        # Guard against HTML login redirects
         if r.status_code == 302 or "text/html" in r.headers.get("content-type", ""):
-            raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid or unauthorized")
+            raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
 
         if r.status_code == 404:
-            raise HTTPException(404, f"File not found in ADO: {path}@{ref or env['REF']}")
+            # Show the exact ref we used to help diagnose branch mismatch
+            raise HTTPException(404, f"File not found in ADO: {path}@{used_ref}")
 
         try:
             r.raise_for_status()
@@ -90,12 +104,13 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         try:
             data = r.json()
         except Exception:
-            raise HTTPException(502, "Azure DevOps returned non-JSON (likely auth redirect or proxy page).")
+            raise HTTPException(502, "Azure DevOps returned non-JSON content (likely auth redirect).")
 
         content = data.get("content")
         if not content:
             raise HTTPException(404, "No content found for this path (might be binary or empty).")
 
+        # Attempt base64 → text; if it's already text, decoding will no-op gracefully
         try:
             content = base64.b64decode(content).decode("utf-8")
         except Exception:
@@ -104,7 +119,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         return {
             "content": content,
             "sha": data.get("objectId") or data.get("commitId") or "unknown",
-            "ref": ref or env["REF"],
+            "ref": used_ref,
         }
 
 # ------------------------------------------------------------
