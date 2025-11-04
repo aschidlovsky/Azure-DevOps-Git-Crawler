@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.4.0")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -185,29 +185,32 @@ TYPE_PATHS = {
 def _looks_like_form_path(file_path: str) -> bool:
     return file_path.startswith("Forms/") or (file_path.lower().endswith(".xpo") and "/forms/" in file_path.lower())
 
-# ---------- Symbol validation (filters false positives) ----------
-# Accept only identifiers that look like AX objects:
-#   - Start with uppercase (e.g., PurchLine, SalesTable, InventTrans)
-#   - Or start with "mss" (your prefix), case-insensitive
+# ---------- Symbol validation ----------
 ALLOWED_SYMBOL = re.compile(r"^(?:[A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})$")
 
-# Extra junk tokens seen in logs that should never be promoted to objects
 EXTRA_SKIP = {
     "override", "method", "methods", "reservation", "buffer",
     "forupdate", "localinventtrans", "maxof", "minof", "sales",
-    "_salesline", "_inventtrans", "_tmpfrmvirtual", "mapmovement", "mapmovementissue"
+    "_salesline", "_inventtrans", "_tmpfrmvirtual", "mapmovement", "mapmovementissue",
+    # NEW: XPO structure/property tokens we never want as objects
+    "endproperties", "properties", "objectpool", "datasource",
+    "name", "table", "allowcreate", "allowdelete", "allowedit",
+    "modelwithoptions", "modelwithoption", "options"
 }
 
 def is_valid_symbol(symbol: str) -> bool:
     if not symbol:
         return False
     s = symbol.strip()
-    if s.lower() in KERNEL_SKIP or s.lower() in EXTRA_SKIP:
+    low = s.lower()
+    if low in KERNEL_SKIP or low in EXTRA_SKIP:
+        return False
+    # Reject ALL-UPPERCASE tokens (filters ENDPROPERTIES, SMD, etc.; allows CamelCase & mss*)
+    if s.isupper():
         return False
     return bool(ALLOWED_SYMBOL.match(s))
 
-# ---------- NEW: variable → type binding (resolve purchTable → PurchTable) ----------
-# X++ style declarations: PurchTable purchTable; mssBDAckTable ack; DictEnum de;
+# ---------- variable → type binding (resolve purchTable → PurchTable) ----------
 DECLARATION_SIG = re.compile(
     r"\b([A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})\s+([a-z][A-Za-z0-9_]*)\s*;", re.MULTILINE
 )
@@ -221,8 +224,7 @@ def _collect_var_types(content: str) -> Dict[str, str]:
             types[var] = typ
     return types
 
-# ---------- NEW: Parse Form DataSource PROPERTIES blocks ----------
-# Matches the block that contains Name/Table/AllowCreate/AllowDelete/AllowEdit, etc.
+# ---------- Parse Form DataSource PROPERTIES blocks ----------
 DS_BLOCK = re.compile(
     r"\bDATASOURCE\b.*?\bPROPERTIES\b(.*?)\bENDPROPERTIES\b",
     re.IGNORECASE | re.DOTALL
@@ -411,6 +413,8 @@ def _should_skip_dep_path(p: str) -> bool:
         "sum","avg","min","max","count","len","is","the","for","select","firstonly",
         "exists","update_recordset","delete_from","insert_recordset","this","super"
     }:
+        return True
+    if symbol.isupper():  # extra guard to block tokens like ENDPROPERTIES, SMD
         return True
     if len(symbol) < 3:
         return True
@@ -682,6 +686,17 @@ async def _analyze_single_file(path: str, ref: Optional[str], file_get_fn, deps_
 async def report_post(payload: Dict[str, Any] = Body(...)):
     """
     Full transitive analysis in one call with a hard deadline and summary mode.
+    Body:
+      {
+        "start_file": "Forms/mssBDAckTableFurn.xpo",
+        "ref": "main",
+        "max_depth": 5,
+        "max_concurrency": 8,
+        "timeout_ms": 110000,
+        "mode": "full" | "summary",
+        "level_cap": 400,
+        "top_n": 200
+      }
     """
     env = get_env()
     start_file: str = payload.get("start_file")
