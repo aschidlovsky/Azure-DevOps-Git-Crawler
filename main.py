@@ -1,6 +1,5 @@
 import os, base64, re, json, logging, asyncio, time
 from typing import Dict, Any, List, Set, Optional
-from functools import lru_cache
 from contextlib import asynccontextmanager
 
 import httpx
@@ -44,7 +43,6 @@ def get_env() -> Dict[str, str]:
 
 def ado_headers(pat: str) -> Dict[str, str]:
     # Azure DevOps requires a non-empty username for PAT auth
-    # (username can be anything non-empty). Keep existing behavior.
     basic = base64.b64encode(f"pat:{pat}".encode()).decode()
     return {
         "Authorization": f"Basic {basic}",
@@ -57,20 +55,18 @@ def ado_base(env: Dict[str, str]) -> str:
     return f"https://dev.azure.com/{env['ORG']}/{env['PROJECT']}/_apis/git/repositories/{env['REPO']}"
 
 # ------------------------------------------------------------
-# GLOBAL EXCEPTION HANDLER (guarantee JSON for Agent)
+# GLOBAL EXCEPTION HANDLER (safety net)
 # ------------------------------------------------------------
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     log.exception("Unhandled exception")
-    # If it's an HTTPException, FastAPI already handled formatting; this is a final safety net.
     return JSONResponse(status_code=500, content={"error": "internal_error", "message": str(exc)[:300]})
 
 # ------------------------------------------------------------
-# SHARED HTTPX CLIENT (no redirects; faster via connection reuse)
+# SHARED HTTPX CLIENT (no redirects; reuse connections)
 # ------------------------------------------------------------
 @asynccontextmanager
 async def shared_client(timeout=60):
-    # follow_redirects=False so we can detect ADO auth redirects or HTML pages
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
         yield client
 
@@ -151,7 +147,6 @@ DEPENDENCY_PATTERNS = [
     (r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", "Table", "crud-call"),
 ]
 
-# Form DS extraction patterns (various XPO shapes)
 FORM_DS_PATTERNS = [
     r"\bOBJECT\s+FORM\s+DATASOURCE\s+(\w+)",
     r"\bDATA\s+SOURCE\s+NAME\s*:\s*(\w+)",
@@ -165,7 +160,6 @@ CRUD_SIGNATURE = re.compile(
     r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", re.IGNORECASE
 )
 
-# Expanded skip: kernel/system names & common false positives
 KERNEL_SKIP = {
     # Kernel/system
     "FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase",
@@ -273,7 +267,6 @@ ALLOWED_FOLDERS = {"Tables", "Classes", "Forms", "Maps"}
 def _should_skip_dep_path(p: str) -> bool:
     """
     Returns True if this normalized path should be ignored (kernel/system/junk).
-    Expects 'Tables/PurchLine.xpo' etc.
     """
     if not p or ".xpo" not in p:
         return True
@@ -299,7 +292,7 @@ def _normalize_dep_path(p: str) -> str:
     Strip 'lcl' or 'Lcl' prefix (including 'lclmss') while preserving 'mss'.
     Examples:
       Tables/lclPurchLine.xpo   -> Tables/PurchLine.xpo
-      Tables/lclmssBDAck.xpo    -> Tables/mssBDAck.xpo   (keep 'mss')
+      Tables/lclmssBDAck.xpo    -> Tables/mssBDAck.xpo
     """
     return re.sub(
         r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
@@ -363,16 +356,6 @@ async def deps_get(
 async def resolve_post(payload: Dict[str, Any] = Body(...)):
     """
     BFS recursion: expands dependencies up to max_depth internally.
-    - Normalizes lcl/lclmss prefixes but preserves 'mss'
-    - Filters kernel/system noise each hop
-    - Adds implicit CRUD for Form DS tables
-    - Handles per-node errors without failing the whole request
-    Body:
-      {
-        "start_file": "Forms/mssBDAckTableFurn.xpo",
-        "ref": "main",
-        "max_depth": 5
-      }
     """
     env = get_env()
     start_file: str = payload.get("start_file")
@@ -417,8 +400,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
 
             dep_paths: List[str] = []
             for d in deps:
-                raw = d.get("path") or ""
-                clean = _normalize_dep_path(raw)
+                clean = _normalize_dep_path(d.get("path") or "")
                 if _should_skip_dep_path(clean):
                     continue
                 dep_paths.append(clean)
@@ -447,13 +429,8 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
     }
 
 # ------------------------------------------------------------
-# /report with deadline, summary mode, caching, breadth caps, trims
+# HELPERS: deadlines, budgeted responses for /report
 # ------------------------------------------------------------
-class _ReqScopeCache:
-    def __init__(self):
-        self.file_json: Dict[tuple, Dict[str, Any]] = {}   # (path, ref) → file_get() result
-        self.deps_json: Dict[tuple, Dict[str, Any]] = {}   # (file, ref) → deps_get() result
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -462,6 +439,68 @@ def _deadline_expired(deadline_ms: int) -> bool:
 
 def _time_left(deadline_ms: int) -> int:
     return max(0, deadline_ms - _now_ms())
+
+def _shrink_report_for_budget(result: Dict[str, Any], budget_bytes: int) -> Dict[str, Any]:
+    """
+    Iteratively trims big arrays until the utf-8 JSON is under budget.
+    Preserves structure and types; only reduces list lengths / long strings.
+    """
+    def size(d: Dict[str, Any]) -> int:
+        return len(json.dumps(d, ensure_ascii=False).encode("utf-8"))
+
+    if size(result) <= budget_bytes:
+        return result
+
+    r = dict(result)
+    arrays = ["objects", "edges", "graph", "business_rules", "implicit_crud", "visited"]
+    trim_steps = [0.5, 0.25, 0.1]
+
+    # Drop non-essential heavy keys inside objects (keep id fields)
+    if "objects" in r and isinstance(r["objects"], list):
+        for o in r["objects"]:
+            if isinstance(o, dict):
+                for k in list(o.keys()):
+                    if k not in ("path", "ref", "sha", "depth", "error"):
+                        o.pop(k, None)
+    if size(r) <= budget_bytes:
+        return r
+
+    # Trim arrays progressively
+    for step in trim_steps:
+        for key in arrays:
+            if key in r and isinstance(r[key], list) and len(r[key]) > 0:
+                keep = max(25, int(len(r[key]) * step))
+                r[key] = r[key][:keep]
+        # shorten business_rule context strings
+        if "business_rules" in r and isinstance(r["business_rules"], list):
+            for br in r["business_rules"]:
+                if isinstance(br, dict) and isinstance(br.get("context"), str) and len(br["context"]) > 120:
+                    br["context"] = br["context"][:120]
+        if size(r) <= budget_bytes:
+            return r
+
+    r["status"] = (r.get("status", "") + " ; partial: payload budget trim").strip(" ;")
+    for key in arrays:
+        if key in r and isinstance(r[key], list):
+            r[key] = r[key][:25]
+    return r
+
+def _json_ok(result: Dict[str, Any], budget_bytes: int = 3_000_000) -> JSONResponse:
+    """Return a JSON 200 with charset, enforcing a byte budget."""
+    safe = _shrink_report_for_budget(result, budget_bytes)
+    return JSONResponse(
+        content=safe,
+        status_code=200,
+        media_type="application/json; charset=utf-8",
+    )
+
+# ------------------------------------------------------------
+# /report with deadline, summary mode, caching, breadth caps, trims
+# ------------------------------------------------------------
+class _ReqScopeCache:
+    def __init__(self):
+        self.file_json: Dict[tuple, Dict[str, Any]] = {}   # (path, ref) → file_get() result
+        self.deps_json: Dict[tuple, Dict[str, Any]] = {}   # (file, ref) → deps_get() result
 
 from asyncio import Semaphore
 
@@ -484,7 +523,7 @@ async def _analyze_single_file(path: str, ref: Optional[str], file_get_fn, deps_
             "error": f"deps_get: {e}"
         }
 
-    # Normalize + filter deps (defense in depth)
+    # Normalize + filter deps
     norm_deps: List[Dict[str, Any]] = []
     for d in deps_res.get("dependencies", []) or []:
         clean = _normalize_dep_path(d.get("path") or "")
@@ -514,18 +553,6 @@ async def _analyze_single_file(path: str, ref: Optional[str], file_get_fn, deps_
 async def report_post(payload: Dict[str, Any] = Body(...)):
     """
     Full transitive analysis in one call with a hard deadline and summary mode.
-
-    Body:
-    {
-      "start_file": "Forms/mssBDAckTableFurn.xpo",
-      "ref": "main",
-      "max_depth": 5,
-      "max_concurrency": 8,
-      "timeout_ms": 110000,          # optional total deadline (default ~110s)
-      "mode": "full" | "summary",    # summary returns counts + top-N
-      "level_cap": 400,              # max nodes expanded per depth level
-      "top_n": 200                   # summary mode: how many items to include
-    }
     """
     env = get_env()
     start_file: str = payload.get("start_file")
@@ -555,7 +582,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     MAX_EDGES   = int(os.getenv("MAX_EDGES",   "12000"))
     MAX_RULES   = int(os.getenv("MAX_RULES",   "5000"))
 
-    # --------- per-request caches to reduce ADO calls ----------
+    # Per-request caches
     scope = _ReqScopeCache()
 
     async def file_get_cached(path: str, ref: Optional[str]):
@@ -592,7 +619,6 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
             return {"file": file, "deps": None, "error": str(e)}
 
     while current_level and depth < max_depth and not _deadline_expired(deadline):
-        # breadth cap per level to avoid explosion
         if len(current_level) > level_cap:
             current_level = current_level[:level_cap]
             overflow = True
@@ -624,14 +650,12 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
             overflow = True
             break
 
-        # unique and remove already visited
         current_level = [f for f in dict.fromkeys(next_level) if f not in visited]
 
     visited_list = sorted(list(visited))
 
     # --------- 2) analyze (bounded concurrency, deadline-aware) ----------
     sem = Semaphore(max_conc)
-
     async def _guarded_analyze(p: str):
         if _deadline_expired(deadline):
             return {"path": p, "ref": used_ref, "error": "deadline_exceeded"}
@@ -671,7 +695,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         business_rules_all.extend(a.get("business_rules", []) or [])
         implicit_crud_all.extend(a.get("implicit_crud", []) or [])
 
-    # de-dupe edges
+    # De-dupe edges
     seen = set()
     dedup_edges = []
     for e in edges:
@@ -681,7 +705,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         seen.add(key)
         dedup_edges.append(e)
 
-    # hard trims for oversized
+    # Hard trims for oversized
     trimmed = False
     if len(dedup_edges) > MAX_EDGES:
         dedup_edges = dedup_edges[:MAX_EDGES]
@@ -700,7 +724,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     if not status_parts:
         status_parts.append("complete")
 
-    return {
+    result = {
         "root": start_file,
         "ref": used_ref,
         "max_depth": max_depth,
@@ -713,3 +737,5 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         "implicit_crud": implicit_crud_all if mode == "full" else implicit_crud_all[:top_n],
         "status": " ; ".join(status_parts)
     }
+    # Enforce a response size budget (default ~3MB) and force JSON+charset
+    return _json_ok(result, budget_bytes=int(os.getenv("REPORT_BUDGET_BYTES", "3000000")))
