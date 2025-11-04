@@ -8,7 +8,7 @@ from asyncio import Semaphore
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.2.1")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,6 +37,11 @@ def get_env() -> Dict[str, str]:
         "PAT": _req("ADO_PAT"),
         "REF": os.getenv("DEFAULT_REF", "main"),
         "API": "7.1-preview.1",
+        # report budget tuning
+        "MAX_REPORT_BYTES": os.getenv("MAX_REPORT_BYTES", "1500000"),
+        "MAX_EDGES_DEFAULT": os.getenv("MAX_EDGES_DEFAULT", "5000"),
+        "MAX_OBJECTS_DEFAULT": os.getenv("MAX_OBJECTS_DEFAULT", "2000"),
+        "MAX_RULES_DEFAULT": os.getenv("MAX_RULES_DEFAULT", "4000"),
     }
 
 def ado_headers(pat: str) -> Dict[str, str]:
@@ -46,7 +51,7 @@ def ado_headers(pat: str) -> Dict[str, str]:
         "Authorization": f"Basic {basic}",
         "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
-        "User-Agent": "ado-git-crawler/1.2",
+        "User-Agent": "ado-git-crawler/1.3",
     }
 
 def ado_base(env: Dict[str, str]) -> str:
@@ -96,7 +101,7 @@ def _looks_like_edt_name(symbol: str) -> bool:
     return any(symbol.endswith(suf) for suf in EDT_LIKE_SUFFIXES)
 
 # RELAXED validator: allow UpperCamelCase OR vendor-prefixed camelCase (mss/msm/wb),
-# OR any camelCase with at least one uppercase after the first char.
+# OR any camelCase with an uppercase after the first char.
 VENDOR_PREFIXES = ("mss", "msm", "wb")
 
 def _is_candidate_symbol(symbol: str) -> bool:
@@ -255,7 +260,6 @@ DEPENDENCY_PATTERNS = [
     (r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete|write)\s*\(", "Table", "crud-call"),
 ]
 
-# Form DS extraction patterns (various XPO shapes)
 FORM_DS_PATTERNS = [
     r"\bOBJECT\s+FORM\s+DATASOURCE\s+(\w+)",
     r"\bDATA\s+SOURCE\s+NAME\s*:\s*(\w+)",
@@ -269,7 +273,6 @@ CRUD_SIGNATURE = re.compile(
     r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete|write)\s*\(", re.IGNORECASE
 )
 
-# which CRUD methods to consider on DS tables regardless of AllowCreate/Delete flags
 FORMS_DS_IMPLICIT_METHODS = ["insert()", "update()", "delete()", "validateWrite()", "write()", "validateDelete()"]
 
 def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
@@ -279,14 +282,12 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     invocations: List[str] = []
     dep_keys: Set[str] = set()
 
-    # Direct dependency detection (with folder mapping)
+    # Direct dep detection
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
         for m in re.finditer(pattern, content, re.IGNORECASE):
             symbol = m.group(2) if reason == "statement" else m.group(1)
             if not symbol:
                 continue
-
-            # Hard stops
             if symbol in KERNEL_SKIP:
                 continue
             if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
@@ -304,7 +305,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 deps.append({"path": path, "type": kind, "symbol": symbol, "reason": reason})
                 dep_keys.add(path)
 
-    # Explicit CRUD calls found in code
+    # Explicit CRUD
     for m in CRUD_SIGNATURE.finditer(content):
         table_sym = m.group(1)
         if not table_sym:
@@ -317,7 +318,6 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             continue
         if _looks_like_edt_name(table_sym):
             continue
-
         implicit.append({
             "table": table_sym,
             "method": m.group(2) + "()",
@@ -325,7 +325,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             "line": m.start()
         })
 
-    # Form DS → implicit dependencies + implicit CRUD on save
+    # Form DS → implicit deps + implicit CRUD
     is_form = _looks_like_form_path(file_path or "")
     ds_tables: Set[str] = set()
     if is_form:
@@ -347,29 +347,23 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 table_path = f"Tables/{sym}.xpo"
                 if table_path not in dep_keys:
                     deps.append({
-                        "path": table_path,
-                        "type": "Table",
-                        "symbol": sym,
-                        "reason": "form-datasource"
+                        "path": table_path, "type": "Table", "symbol": sym, "reason": "form-datasource"
                     })
                     dep_keys.add(table_path)
 
             for sym in ds_tables:
                 for method in FORMS_DS_IMPLICIT_METHODS:
                     implicit.append({
-                        "table": sym,
-                        "method": method,
-                        "caller": "FormSaveKernel",
-                        "line": -1,
+                        "table": sym, "method": method,
+                        "caller": "FormSaveKernel", "line": -1,
                         "reason": "implicit-form-datasource-crud"
                     })
 
-    # Business-rule signals + invocation cues
+    # Business rules + invocation cues
     for ln, line in enumerate(content.splitlines(), start=1):
         s = line.strip()
         if any(k in s for k in ["validate", "error(", "ttsBegin", "ttsCommit"]):
             business.append({"line": ln, "context": s[:160]})
-        # crude invocation hints (init/construct/run)
         if re.search(r"\b(init|construct|run)\s*\(", s):
             invocations.append(s[:160])
 
@@ -377,7 +371,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     return {"dependencies": deps, "implicit_crud": implicit, "business_rules": business, "invocations": invocations}
 
 # ------------------------------------------------------------
-# ENDPOINT: /file
+# /file
 # ------------------------------------------------------------
 @app.get("/file")
 @app.get("/file/")
@@ -389,7 +383,7 @@ async def file_get(
     return {"path": path, "ref": data["ref"], "sha": data["sha"], "content": data["content"]}
 
 # ------------------------------------------------------------
-# ENDPOINT: /deps (single-hop)
+# /deps (single-hop)
 # ------------------------------------------------------------
 @app.get("/deps")
 @app.get("/deps/")
@@ -426,14 +420,9 @@ async def deps_get(
     }
 
 # ------------------------------------------------------------
-# INTERNAL: safe deps fetch with normalization + targeted 404 reclass
+# INTERNAL: targeted reclass wrappers
 # ------------------------------------------------------------
 async def _deps_with_reclass(file_path: str, ref: str) -> Dict[str, Any]:
-    """
-    Attempts deps_get(file_path, ref). If it 404s because the folder/type was wrong,
-    try a *targeted* reclass (Table -> Class) for *Type/Ax* symbols.
-    Returns dict with fields: file, deps, implicit, business, invocations, error, used_path
-    """
     try:
         node = await deps_get(file=file_path, ref=ref, page=1, limit=200)  # type: ignore
         return {
@@ -448,7 +437,6 @@ async def _deps_with_reclass(file_path: str, ref: str) -> Dict[str, Any]:
     except HTTPException as e:
         if e.status_code != 404:
             return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
-        # 404: consider Table -> Class retry if pattern matches
         m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", file_path)
         if not m:
             return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
@@ -457,7 +445,6 @@ async def _deps_with_reclass(file_path: str, ref: str) -> Dict[str, Any]:
             return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
         if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
             return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
-
         kind_guess = "Table" if folder == "Tables" else "Unknown"
         fallbacks = _fallback_kinds_on_404(kind_guess, symbol)
         for fb_kind in fallbacks:
@@ -465,8 +452,7 @@ async def _deps_with_reclass(file_path: str, ref: str) -> Dict[str, Any]:
             try:
                 node = await deps_get(file=alt_path, ref=ref, page=1, limit=200)  # type: ignore
                 return {
-                    "file": file_path,
-                    "used_path": alt_path,
+                    "file": file_path, "used_path": alt_path,
                     "deps": node.get("dependencies", []),
                     "implicit": node.get("implicit_crud", []),
                     "business": node.get("business_rules", []),
@@ -474,31 +460,38 @@ async def _deps_with_reclass(file_path: str, ref: str) -> Dict[str, Any]:
                     "error": None
                 }
             except Exception:
-                continue  # give up silently if alt also fails
-
+                continue
         return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
     except Exception as e:
         return {"file": file_path, "used_path": file_path, "deps": None, "implicit": [], "business": [], "invocations": [], "error": str(e)}
 
+async def _file_with_reclass(path: str, ref: Optional[str]) -> Dict[str, Any]:
+    try:
+        fr = await file_get(path=path, ref=ref)  # type: ignore
+        return {"used_path": path, **fr}
+    except HTTPException as e:
+        if e.status_code != 404:
+            raise
+        m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", path)
+        if not m:
+            raise
+        folder, symbol = m.group(1), m.group(2)
+        if folder != "Tables":
+            raise
+        if not _is_candidate_symbol(symbol) or _looks_like_edt_name(symbol):
+            raise
+        if not (symbol.endswith("Type") or symbol.startswith("Ax")):
+            raise
+        alt = f"Classes/{symbol}.xpo"
+        fr = await file_get(path=alt, ref=ref)  # may raise
+        return {"used_path": alt, **fr}
+
 # ------------------------------------------------------------
-# ENDPOINT: /resolve (recursive multi-hop BFS)
+# /resolve (BFS)
 # ------------------------------------------------------------
 @app.post("/resolve")
 @app.post("/resolve/")
 async def resolve_post(payload: Dict[str, Any] = Body(...)):
-    """
-    BFS recursion: expands dependencies up to max_depth internally.
-    - Normalizes lcl/lclmss prefixes but preserves 'mss'
-    - Filters kernel/system noise each hop
-    - Adds implicit CRUD for Form DS tables
-    - Handles per-node errors without failing the whole request
-    Body:
-      {
-        "start_file": "Forms/mssBDAckTableFurn.xpo",
-        "ref": "main",
-        "max_depth": 5
-      }
-    """
     env = get_env()
     start_file: str = payload.get("start_file")
     if not start_file:
@@ -524,8 +517,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
 
         next_level: List[str] = []
         for res in results:
-            file = res["file"]
-            used_path = res.get("used_path", file)
+            used_path = res.get("used_path", res.get("file"))
             err = res.get("error")
             deps = res.get("deps") or []
             implicit_all.extend(res.get("implicit", []))
@@ -541,12 +533,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
                     continue
                 dep_paths.append(clean)
 
-            graph.append({
-                "file": used_path,
-                "depth": depth,
-                "dependencies": dep_paths,
-                "error": None
-            })
+            graph.append({"file": used_path, "depth": depth, "dependencies": dep_paths, "error": None})
             next_level.extend(dep_paths)
 
         depth += 1
@@ -565,38 +552,86 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
     }
 
 # ------------------------------------------------------------
-# INTERNAL: analyze a single file (with targeted 404 reclass on /file)
+# INTERNAL: analyze + size budget
 # ------------------------------------------------------------
-async def _file_with_reclass(path: str, ref: Optional[str]) -> Dict[str, Any]:
-    """
-    Try /file; if 404 and looks like Tables/<Type|Ax*>.xpo, retry as Classes/<Symbol>.xpo
-    Returns: dict(content, sha, ref, used_path)
-    """
+def _json_size_bytes(obj: Any) -> int:
     try:
-        fr = await file_get(path=path, ref=ref)  # type: ignore
-        return {"used_path": path, **fr}
-    except HTTPException as e:
-        if e.status_code != 404:
-            raise
-        m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", path)
-        if not m:
-            raise
-        folder, symbol = m.group(1), m.group(2)
-        if folder != "Tables":
-            raise
-        if not _is_candidate_symbol(symbol) or _looks_like_edt_name(symbol):
-            raise
-        if not (symbol.endswith("Type") or symbol.startswith("Ax")):
-            raise
-        alt = f"Classes/{symbol}.xpo"
-        fr = await file_get(path=alt, ref=ref)  # may raise
-        return {"used_path": alt, **fr}
+        return len(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except Exception:
+        # if not serializable, fall back to big number to trigger pruning
+        return 10**12
+
+def _shrink_list_prefix(lst: List[Any], keep: int) -> List[Any]:
+    if keep >= len(lst):
+        return lst
+    return lst[:keep]
+
+def _enforce_budget(report: Dict[str, Any],
+                    budget_bytes: int,
+                    caps: Dict[str, int]) -> Dict[str, Any]:
+    """
+    Shrink report deterministically until within budget.
+    Order: business_rules -> implicit_crud -> edges -> objects -> graph -> visited
+    Adds fields: truncated, approx_bytes, original_counts, returned_counts
+    """
+    original = {
+        "objects": len(report.get("objects", [])),
+        "edges": len(report.get("edges", [])),
+        "business_rules": len(report.get("business_rules", [])),
+        "implicit_crud": len(report.get("implicit_crud", [])),
+        "graph": len(report.get("graph", [])),
+        "visited": len(report.get("visited", [])),
+    }
+
+    # hard caps first (optional)
+    report["edges"] = _shrink_list_prefix(report.get("edges", []), caps.get("max_edges", 10**9))
+    report["objects"] = _shrink_list_prefix(report.get("objects", []), caps.get("max_objects", 10**9))
+    report["business_rules"] = _shrink_list_prefix(report.get("business_rules", []), caps.get("max_rules", 10**9))
+
+    # iterative shrink if still over budget
+    order = ["business_rules", "implicit_crud", "edges", "objects", "graph", "visited"]
+    step_fraction = {
+        "business_rules": 0.7,
+        "implicit_crud": 0.7,
+        "edges": 0.7,
+        "objects": 0.8,
+        "graph": 0.8,
+        "visited": 0.8,
+    }
+
+    truncated = False
+    size = _json_size_bytes(report)
+    while size > budget_bytes:
+        for key in order:
+            arr = report.get(key, [])
+            if not isinstance(arr, list) or len(arr) <= 1:
+                continue
+            keep = max(1, int(len(arr) * step_fraction[key]))
+            report[key] = arr[:keep]
+            truncated = True
+            size = _json_size_bytes(report)
+            if size <= budget_bytes:
+                break
+        else:
+            # nothing more to shrink
+            break
+
+    returned = {
+        "objects": len(report.get("objects", [])),
+        "edges": len(report.get("edges", [])),
+        "business_rules": len(report.get("business_rules", [])),
+        "implicit_crud": len(report.get("implicit_crud", [])),
+        "graph": len(report.get("graph", [])),
+        "visited": len(report.get("visited", [])),
+    }
+
+    report["truncated"] = truncated
+    report["approx_bytes"] = size
+    report["original_counts"] = original
+    report["returned_counts"] = returned
+    return report
 
 async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
-    """
-    Fetches content (/file with reclass) and direct analysis (/deps with reclass) for a single path.
-    Returns a compact dict used by /report aggregation.
-    """
     try:
         file_res = await _file_with_reclass(path, ref)
     except Exception as e:
@@ -656,24 +691,25 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
     }
 
 # ------------------------------------------------------------
-# ENDPOINT: /report (resolve + analyze every visited file)
+# /report (resolve + analyze + budget)
 # ------------------------------------------------------------
 @app.post("/report")
 @app.post("/report/")
 async def report_post(payload: Dict[str, Any] = Body(...)):
     """
     Full transitive analysis in one call:
-      1) resolve -> full visited set (depth <= max_depth) with targeted reclass
-      2) analyze each visited file -> (/file + /deps) with targeted reclass
+      1) resolve -> visited set (depth <= max_depth)
+      2) analyze each visited file -> (/file + /deps)
       3) merge into a single report payload
+      4) enforce response-size budget to avoid upstream gateway errors
 
-    Body:
-    {
-      "start_file": "Forms/mssBDAckTableFurn.xpo",
-      "ref": "main",
-      "max_depth": 5,
-      "max_concurrency": 8   # optional
-    }
+    Body overrides (optional):
+      - max_depth: int (default 5)
+      - max_concurrency: int (default env MAX_CONCURRENCY or 8)
+      - max_bytes: int (default env MAX_REPORT_BYTES or 1_500_000)
+      - max_edges: int (default env MAX_EDGES_DEFAULT or 5000)
+      - max_objects: int (default env MAX_OBJECTS_DEFAULT or 2000)
+      - max_rules: int (default env MAX_RULES_DEFAULT or 4000)
     """
     env = get_env()
     start_file: str = payload.get("start_file")
@@ -682,8 +718,17 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     used_ref = payload.get("ref") or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
+
     max_depth = int(payload.get("max_depth", 5))
     max_conc = int(payload.get("max_concurrency", int(os.getenv("MAX_CONCURRENCY", "8"))))
+
+    # budget and caps
+    budget_bytes = int(payload.get("max_bytes", env["MAX_REPORT_BYTES"]))
+    caps = {
+        "max_edges": int(payload.get("max_edges", env["MAX_EDGES_DEFAULT"])),
+        "max_objects": int(payload.get("max_objects", env["MAX_OBJECTS_DEFAULT"])),
+        "max_rules": int(payload.get("max_rules", env["MAX_RULES_DEFAULT"])),
+    }
 
     # --------- 1) internal resolve ----------
     visited: Set[str] = set()
@@ -730,7 +775,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
 
     analyses = await asyncio.gather(*[_guarded_analyze(p) for p in visited_list])
 
-    # --------- 3) merge into objects/edges/rules ----------
+    # --------- 3) merge ----------
     objects: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     business_rules_all: List[Dict[str, Any]] = []
@@ -766,7 +811,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         seen.add(key)
         dedup_edges.append(e)
 
-    return {
+    out = {
         "root": start_file,
         "ref": used_ref,
         "max_depth": max_depth,
@@ -779,3 +824,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         "implicit_crud": implicit_crud_all,
         "status": "complete"
     }
+
+    # --------- 4) enforce size budget ----------
+    out = _enforce_budget(out, budget_bytes, caps)
+    return out
