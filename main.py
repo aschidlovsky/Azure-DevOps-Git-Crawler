@@ -8,7 +8,7 @@ from asyncio import Semaphore
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.2.0")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -95,9 +95,24 @@ def _looks_like_edt_name(symbol: str) -> bool:
     if not symbol: return False
     return any(symbol.endswith(suf) for suf in EDT_LIKE_SUFFIXES)
 
+# RELAXED validator: allow UpperCamelCase OR vendor-prefixed camelCase (mss/msm/wb),
+# OR any camelCase with at least one uppercase after the first char.
+VENDOR_PREFIXES = ("mss", "msm", "wb")
+
 def _is_candidate_symbol(symbol: str) -> bool:
-    # Only accept PascalCase-ish symbols: first char uppercase alpha.
-    return bool(symbol) and symbol[0].isalpha() and symbol[0].isupper()
+    if not symbol or len(symbol) < 3:
+        return False
+    # UpperCamelCase
+    if symbol[0].isalpha() and symbol[0].isupper():
+        return True
+    # vendor-prefixed camelCase like mssBDAckTable
+    for pref in VENDOR_PREFIXES:
+        if symbol.startswith(pref) and len(symbol) > len(pref) and symbol[len(pref)].isupper():
+            return True
+    # generic camelCase with an uppercase somewhere after the first char
+    if any(ch.isupper() for ch in symbol[1:]):
+        return True
+    return False
 
 def _normalize_dep_path(p: str) -> str:
     """
@@ -358,6 +373,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         if re.search(r"\b(init|construct|run)\s*\(", s):
             invocations.append(s[:160])
 
+    log.info(f"[extract] file={file_path} deps={len(deps)} ds={len(ds_tables)} crud={len(implicit)} rules={len(business)}")
     return {"dependencies": deps, "implicit_crud": implicit, "business_rules": business, "invocations": invocations}
 
 # ------------------------------------------------------------
@@ -504,7 +520,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
 
-        results = await asyncio.gather(*[_deps_with_reclass(f) for f in level_files])
+        results = await asyncio.gather(*[_deps_with_reclass(f, used_ref) for f in level_files])
 
         next_level: List[str] = []
         for res in results:
