@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.3.0")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,7 +48,7 @@ def ado_headers(pat: str) -> Dict[str, str]:
         "Authorization": f"Basic {basic}",
         "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
-        "User-Agent": "ado-git-crawler/1.3",
+        "User-Agent": "ado-git-crawler/1.4",
     }
 
 def ado_base(env: Dict[str, str]) -> str:
@@ -221,6 +221,47 @@ def _collect_var_types(content: str) -> Dict[str, str]:
             types[var] = typ
     return types
 
+# ---------- NEW: Parse Form DataSource PROPERTIES blocks ----------
+# Matches the block that contains Name/Table/AllowCreate/AllowDelete/AllowEdit, etc.
+DS_BLOCK = re.compile(
+    r"\bDATASOURCE\b.*?\bPROPERTIES\b(.*?)\bENDPROPERTIES\b",
+    re.IGNORECASE | re.DOTALL
+)
+
+def _parse_form_datasources(content: str) -> List[Dict[str, Optional[str]]]:
+    """
+    Extract DataSource 'Table' and permission flags from a Form XPO.
+    Returns a list of dicts: {table, allow_create, allow_delete, allow_edit} with values:
+      - table: 'mssBDAckTable' (string) or None
+      - flags: True / False / None (None = unspecified)
+    """
+    results: List[Dict[str, Optional[str]]] = []
+    for m in DS_BLOCK.finditer(content):
+        props = m.group(1)
+
+        def _find_str(name: str) -> Optional[str]:
+            mm = re.search(rf"\b{name}\b\s*[:=]?\s*#?([A-Za-z0-9_]+)", props, re.IGNORECASE)
+            return mm.group(1) if mm else None
+
+        def _find_bool(name: str) -> Optional[bool]:
+            mm = re.search(rf"\b{name}\b\s*[:=]?\s*#?(Yes|No)", props, re.IGNORECASE)
+            if not mm:
+                return None
+            return mm.group(1).lower() == "yes"
+
+        table = _find_str("Table")
+        allow_create = _find_bool("AllowCreate")
+        allow_delete = _find_bool("AllowDelete")
+        allow_edit   = _find_bool("AllowEdit")
+
+        results.append({
+            "table": table,
+            "allow_create": allow_create,
+            "allow_delete": allow_delete,
+            "allow_edit": allow_edit,
+        })
+    return results
+
 def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
     deps: List[Dict[str, Any]] = []
     implicit: List[Dict[str, Any]] = []
@@ -280,40 +321,62 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 })
                 dep_keys.add(table_path)
 
-    # Form DS → implicit dependencies + implicit CRUD on save
+    # Form DS → dependency on the DS Table + CRUD methods gated by Allow* flags
     is_form = _looks_like_form_path(file_path or "")
     if is_form:
-        ds_tables: Set[str] = set()
-        for p in FORM_DS_PATTERNS:
-            for mm in re.finditer(p, content, re.IGNORECASE):
-                sym = mm.group(1)
-                if not sym or not is_valid_symbol(sym):
-                    continue
-                if sym in KERNEL_SKIP or len(sym) < 3:
-                    continue
-                ds_tables.add(sym)
+        # 1) Prefer explicit PROPERTIES parsing for authoritative DS config
+        ds_list = _parse_form_datasources(content)
 
-        if ds_tables:
-            for sym in ds_tables:
-                table_path = f"Tables/{sym}.xpo"
-                if table_path not in dep_keys:
-                    deps.append({
-                        "path": table_path,
-                        "type": "Table",
-                        "symbol": sym,
-                        "reason": "form-datasource"
-                    })
-                    dep_keys.add(table_path)
+        # 2) Fallback: legacy patterns (kept for compatibility)
+        if not ds_list:
+            legacy_ds: Set[str] = set()
+            for p in FORM_DS_PATTERNS:
+                for mm in re.finditer(p, content, re.IGNORECASE):
+                    sym = mm.group(1)
+                    if sym and is_valid_symbol(sym) and sym not in KERNEL_SKIP and len(sym) >= 3:
+                        legacy_ds.add(sym)
+            ds_list = [{"table": t, "allow_create": None, "allow_delete": None, "allow_edit": None} for t in legacy_ds]
 
-            for sym in ds_tables:
-                for method in ["insert()", "update()", "delete()", "validateWrite()", "validateDelete()"]:
-                    implicit.append({
-                        "table": sym,
-                        "method": method,
-                        "caller": "FormSaveKernel",
-                        "line": -1,
-                        "reason": "implicit-form-datasource-crud"
-                    })
+        for ds in ds_list:
+            sym = (ds.get("table") or "").strip()
+            if not sym or not is_valid_symbol(sym):
+                continue
+
+            # Always add the Table dependency for the DS
+            table_path = f"Tables/{sym}.xpo"
+            if table_path not in dep_keys:
+                deps.append({
+                    "path": table_path,
+                    "type": "Table",
+                    "symbol": sym,
+                    "reason": "form-datasource"
+                })
+                dep_keys.add(table_path)
+
+            # Determine allowed CRUD from flags; unspecified ⇒ permissive (include)
+            allow_create = ds.get("allow_create")
+            allow_delete = ds.get("allow_delete")
+            allow_edit   = ds.get("allow_edit")
+
+            methods: List[str] = []
+            # Edit controls UPDATE (+ validateWrite + write)
+            if allow_edit is not False:
+                methods.extend(["update()", "validateWrite()", "write()"])
+            # Create controls INSERT
+            if allow_create is not False:
+                methods.append("insert()")
+            # Delete controls DELETE (+ validateDelete)
+            if allow_delete is not False:
+                methods.extend(["delete()", "validateDelete()"])
+
+            for method in methods:
+                implicit.append({
+                    "table": sym,
+                    "method": method,
+                    "caller": "FormSaveKernel",
+                    "line": -1,
+                    "reason": "implicit-form-datasource-crud"
+                })
 
     # Business-rule signals
     for ln, line in enumerate(content.splitlines(), start=1):
