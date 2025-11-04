@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.2.0")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,7 +48,7 @@ def ado_headers(pat: str) -> Dict[str, str]:
         "Authorization": f"Basic {basic}",
         "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
-        "User-Agent": "ado-git-crawler/1.2",
+        "User-Agent": "ado-git-crawler/1.3",
     }
 
 def ado_base(env: Dict[str, str]) -> str:
@@ -137,7 +137,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         }
 
 # ------------------------------------------------------------
-# LIGHTWEIGHT PARSER (with kernel/system filtering + Form DS implicit CRUD)
+# LIGHTWEIGHT PARSER (kernel/system filter + Form DS implicit CRUD)
 # ------------------------------------------------------------
 DEPENDENCY_PATTERNS = [
     # Tables referenced in queries (avoids EDT/field names)
@@ -206,11 +206,29 @@ def is_valid_symbol(symbol: str) -> bool:
         return False
     return bool(ALLOWED_SYMBOL.match(s))
 
+# ---------- NEW: variable → type binding (resolve purchTable → PurchTable) ----------
+# X++ style declarations: PurchTable purchTable; mssBDAckTable ack; DictEnum de;
+DECLARATION_SIG = re.compile(
+    r"\b([A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})\s+([a-z][A-Za-z0-9_]*)\s*;", re.MULTILINE
+)
+
+def _collect_var_types(content: str) -> Dict[str, str]:
+    """Map lowercase buffer names -> PascalCase type (e.g., purchTable -> PurchTable)."""
+    types: Dict[str, str] = {}
+    for m in DECLARATION_SIG.finditer(content):
+        typ, var = m.group(1), m.group(2)
+        if is_valid_symbol(typ):
+            types[var] = typ
+    return types
+
 def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
     deps: List[Dict[str, Any]] = []
     implicit: List[Dict[str, Any]] = []
     business: List[Dict[str, Any]] = []
     dep_keys: Set[str] = set()
+
+    # variable type table (for resolving lowercase buffers in CRUD)
+    var_types = _collect_var_types(content)
 
     # Direct dependency detection (with folder mapping)
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
@@ -231,16 +249,36 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 deps.append({"path": path, "type": kind, "symbol": symbol, "reason": reason})
                 dep_keys.add(path)
 
-    # Explicit CRUD calls found in code
+    # Explicit CRUD calls found in code (resolve variable -> declared type)
     for m in CRUD_SIGNATURE.finditer(content):
-        table_sym = m.group(1)
-        if table_sym and is_valid_symbol(table_sym) and table_sym not in KERNEL_SKIP and len(table_sym) >= 3:
+        raw_sym = m.group(1)            # could be 'PurchTable' or 'purchTable'
+        method = m.group(2) + "()"      # e.g., update()
+
+        resolved: Optional[str] = None
+        if is_valid_symbol(raw_sym):
+            resolved = raw_sym
+        else:
+            cand = var_types.get(raw_sym)
+            if cand and is_valid_symbol(cand):
+                resolved = cand
+
+        if resolved:
             implicit.append({
-                "table": table_sym,
-                "method": m.group(2) + "()",
+                "table": resolved,
+                "method": method,
                 "caller": "unknown",
                 "line": m.start()
             })
+            # Also promote as a dependency edge to the Table
+            table_path = f"Tables/{resolved}.xpo"
+            if table_path not in dep_keys:
+                deps.append({
+                    "path": table_path,
+                    "type": "Table",
+                    "symbol": resolved,
+                    "reason": "crud-call"
+                })
+                dep_keys.add(table_path)
 
     # Form DS → implicit dependencies + implicit CRUD on save
     is_form = _looks_like_form_path(file_path or "")
@@ -683,7 +721,6 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     visited_list = sorted(list(visited))
 
     # --------- 2) analyze (bounded concurrency, deadline-aware) ----------
-    from asyncio import Semaphore
     sem = Semaphore(max_conc)
     async def _guarded_analyze(p: str):
         if _deadline_expired(deadline):
@@ -736,11 +773,11 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
 
     # Hard trims for oversized
     trimmed = False
-    if len(dedup_edges) > MAX_EDGES:
-        dedup_edges = dedup_edges[:MAX_EDGES]
+    if len(dedup_edges) > int(os.getenv("MAX_EDGES", "12000")):
+        dedup_edges = dedup_edges[:int(os.getenv("MAX_EDGES", "12000"))]
         trimmed = True
-    if len(business_rules_all) > MAX_RULES:
-        business_rules_all = business_rules_all[:MAX_RULES]
+    if len(business_rules_all) > int(os.getenv("MAX_RULES", "5000")):
+        business_rules_all = business_rules_all[:int(os.getenv("MAX_RULES", "5000"))]
         trimmed = True
 
     status_parts = []
