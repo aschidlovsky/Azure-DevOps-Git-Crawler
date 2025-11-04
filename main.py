@@ -6,11 +6,12 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from asyncio import Semaphore
 
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.4.1")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,7 +49,7 @@ def ado_headers(pat: str) -> Dict[str, str]:
         "Authorization": f"Basic {basic}",
         "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
-        "User-Agent": "ado-git-crawler/1.4",
+        "User-Agent": "ado-git-crawler/1.5",
     }
 
 def ado_base(env: Dict[str, str]) -> str:
@@ -140,7 +141,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 # LIGHTWEIGHT PARSER (kernel/system filter + Form DS implicit CRUD)
 # ------------------------------------------------------------
 DEPENDENCY_PATTERNS = [
-    # Tables referenced in queries (avoids EDT/field names)
+    # prefer table refs via from/join to avoid EDT/field names
     (r"\b(from|join)\s+([A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})\b", "Table", "from-join"),
     (r"\b(\w+)\.DataSource\(", "Table", "DataSource()"),
     (r"\b(\w+)::(construct|new|run)\b", "Class", "static-call"),
@@ -188,15 +189,22 @@ def _looks_like_form_path(file_path: str) -> bool:
 # ---------- Symbol validation ----------
 ALLOWED_SYMBOL = re.compile(r"^(?:[A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})$")
 
+# XPO/property tokens and other junk we never want as objects
 EXTRA_SKIP = {
     "override", "method", "methods", "reservation", "buffer",
     "forupdate", "localinventtrans", "maxof", "minof", "sales",
     "_salesline", "_inventtrans", "_tmpfrmvirtual", "mapmovement", "mapmovementissue",
-    # NEW: XPO structure/property tokens we never want as objects
     "endproperties", "properties", "objectpool", "datasource",
     "name", "table", "allowcreate", "allowdelete", "allowedit",
     "modelwithoptions", "modelwithoption", "options"
 }
+
+# Framework/utility prefix block to cut fan-out + 404s
+FRAMEWORK_PREFIXES = (
+    "Dict", "Sys", "ImageListAppl_", "Dialog", "ExecutePermission",
+    "ListIterator", "Xml", "MapIterator", "Ledger", "CustVendPaymSched",
+    "PriceDisc", "SalesTotals", "SalesCalcTax"
+)
 
 def is_valid_symbol(symbol: str) -> bool:
     if not symbol:
@@ -205,7 +213,10 @@ def is_valid_symbol(symbol: str) -> bool:
     low = s.lower()
     if low in KERNEL_SKIP or low in EXTRA_SKIP:
         return False
-    # Reject ALL-UPPERCASE tokens (filters ENDPROPERTIES, SMD, etc.; allows CamelCase & mss*)
+    # hard block framework/utility prefixes
+    if any(s.startswith(p) for p in FRAMEWORK_PREFIXES):
+        return False
+    # Reject ALL-UPPERCASE tokens (filters ENDPROPERTIES, SMD, etc.)
     if s.isupper():
         return False
     return bool(ALLOWED_SYMBOL.match(s))
@@ -279,7 +290,6 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             symbol = m.group(2) if reason in ("from-join", "statement") else m.group(1)
             if not symbol:
                 continue
-            # reject non-AX-ish or obvious junk identifiers
             if not is_valid_symbol(symbol):
                 continue
             if symbol in KERNEL_SKIP:
@@ -403,6 +413,9 @@ def _should_skip_dep_path(p: str) -> bool:
         return True
     folder, symbol = m.group(1), m.group(2)
     if folder not in ALLOWED_FOLDERS:
+        return True
+    # block framework/utility prefixes at path level too
+    if any(symbol.startswith(pref) for pref in FRAMEWORK_PREFIXES):
         return True
     # enforce valid AX-like symbol form
     if not is_valid_symbol(symbol):
@@ -621,6 +634,8 @@ def _shrink_report_for_budget(result: Dict[str, Any], budget_bytes: int) -> Dict
 def _json_ok(result: Dict[str, Any], budget_bytes: int = 3_000_000) -> JSONResponse:
     """Return a JSON 200 with charset, enforcing a byte budget."""
     safe = _shrink_report_for_budget(result, budget_bytes)
+    # Log final payload size for Agent debugging
+    log.info(f"[report] payload_bytes={len(json.dumps(safe, ensure_ascii=False).encode('utf-8'))} status={safe.get('status')}")
     return JSONResponse(
         content=safe,
         status_code=200,
@@ -634,8 +649,6 @@ class _ReqScopeCache:
     def __init__(self):
         self.file_json: Dict[tuple, Dict[str, Any]] = {}   # (path, ref) → file_get() result
         self.deps_json: Dict[tuple, Dict[str, Any]] = {}   # (file, ref) → deps_get() result
-
-from asyncio import Semaphore
 
 async def _analyze_single_file(path: str, ref: Optional[str], file_get_fn, deps_get_fn, deadline_ms: int) -> Dict[str, Any]:
     if _deadline_expired(deadline_ms):
@@ -851,11 +864,11 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
 
     # Hard trims for oversized
     trimmed = False
-    if len(dedup_edges) > int(os.getenv("MAX_EDGES", "12000")):
-        dedup_edges = dedup_edges[:int(os.getenv("MAX_EDGES", "12000"))]
+    if len(dedup_edges) > MAX_EDGES:
+        dedup_edges = dedup_edges[:MAX_EDGES]
         trimmed = True
-    if len(business_rules_all) > int(os.getenv("MAX_RULES", "5000")):
-        business_rules_all = business_rules_all[:int(os.getenv("MAX_RULES", "5000"))]
+    if len(business_rules_all) > MAX_RULES:
+        business_rules_all = business_rules_all[:MAX_RULES]
         trimmed = True
 
     status_parts = []
