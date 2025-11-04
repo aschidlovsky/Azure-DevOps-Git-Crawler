@@ -7,7 +7,7 @@ import httpx
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.5")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,7 +118,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         }
 
 # ------------------------------------------------------------
-# LIGHTWEIGHT PARSER (with kernel/system filtering)
+# LIGHTWEIGHT PARSER (with kernel/system filtering + Form DataSource implicit CRUD)
 # ------------------------------------------------------------
 DEPENDENCY_PATTERNS = [
     (r"\b(select|insert|update|delete)\s+(\w+)", "Table", "statement"),
@@ -126,6 +126,16 @@ DEPENDENCY_PATTERNS = [
     (r"\b(\w+)::(construct|new|run)\b", "Class", "static-call"),
     (r"\bnew\s+(\w+)\s*\(", "Class", "new"),
     (r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", "Table", "crud-call"),
+]
+
+# Extra patterns to pull Form DataSource tables from .xpo forms
+FORM_DS_PATTERNS = [
+    r"\bOBJECT\s+FORM\s+DATASOURCE\s+(\w+)",          # "OBJECT FORM DATASOURCE PurchTable"
+    r"\bDATA\s+SOURCE\s+NAME\s*:\s*(\w+)",            # variants
+    r"\bFormDataSource\s+(\w+)",                      # class-like declarative
+    r"\bdataSource\s*\(\s*(\w+)\s*\)",                # method-style dataSource(SomeTable)
+    r"\bDataSource\s*\(\s*(\w+)\s*\)",                # already handled, but keep here too
+    r"\bDATA\s+SOURCE\s+(\w+)",                       # looser
 ]
 
 CRUD_SIGNATURE = re.compile(
@@ -154,10 +164,14 @@ TYPE_PATHS = {
     "Unknown": "Unknown"
 }
 
-def extract_dependencies(content: str) -> Dict[str, Any]:
+def _looks_like_form_path(file_path: str) -> bool:
+    return file_path.startswith("Forms/") or file_path.lower().endswith(".xpo") and "/forms/" in file_path.lower()
+
+def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
     deps: List[Dict[str, Any]] = []
     implicit: List[Dict[str, Any]] = []
     business: List[Dict[str, Any]] = []
+    dep_keys: Set[str] = set()  # prevent dup paths
 
     # Direct dependency detection
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
@@ -174,23 +188,63 @@ def extract_dependencies(content: str) -> Dict[str, Any]:
             if len(symbol) < 3:
                 continue
 
-            deps.append({
-                "path": f"{TYPE_PATHS.get(kind, 'Unknown')}/{symbol}.xpo",
-                "type": kind,
-                "symbol": symbol,
-                "reason": reason
-            })
+            path = f"{TYPE_PATHS.get(kind, 'Unknown')}/{symbol}.xpo"
+            if path not in dep_keys:
+                deps.append({
+                    "path": path,
+                    "type": kind,
+                    "symbol": symbol,
+                    "reason": reason
+                })
+                dep_keys.add(path)
 
-    # Implicit CRUD calls
+    # Implicit CRUD calls found explicitly in code
     for m in CRUD_SIGNATURE.finditer(content):
         table_sym = m.group(1)
-        if table_sym and table_sym not in KERNEL_SKIP:
+        if table_sym and table_sym not in KERNEL_SKIP and len(table_sym) >= 3:
             implicit.append({
                 "table": table_sym,
                 "method": m.group(2) + "()",
                 "caller": "unknown",
                 "line": m.start()
             })
+
+    # ----- NEW: Form DataSource → implicit CRUD & dependency on the table -----
+    is_form = _looks_like_form_path(file_path or "")
+    if is_form:
+        ds_tables: Set[str] = set()
+        for p in FORM_DS_PATTERNS:
+            for m in re.finditer(p, content, re.IGNORECASE):
+                sym = m.group(1)
+                if not sym:
+                    continue
+                if sym in KERNEL_SKIP or len(sym) < 3:
+                    continue
+                ds_tables.add(sym)
+
+        if ds_tables:
+            # For each DS table, add the table as a dependency (reason=form-datasource)
+            for sym in ds_tables:
+                table_path = f"Tables/{sym}.xpo"
+                if table_path not in dep_keys:
+                    deps.append({
+                        "path": table_path,
+                        "type": "Table",
+                        "symbol": sym,
+                        "reason": "form-datasource"
+                    })
+                    dep_keys.add(table_path)
+
+            # Add implicit CRUD triggers that occur on form save (kernel-level)
+            for sym in ds_tables:
+                for method in ["insert()", "update()", "delete()", "validateWrite()", "validateDelete()"]:
+                    implicit.append({
+                        "table": sym,
+                        "method": method,
+                        "caller": "FormSaveKernel",      # kernel-triggered via form datasource save
+                        "line": -1,
+                        "reason": "implicit-form-datasource-crud"
+                    })
 
     # Business-rule signals (lightweight)
     for ln, line in enumerate(content.splitlines(), start=1):
@@ -255,7 +309,7 @@ async def deps_get(
 ):
     fetched = await get_item_content(file, ref)
     content, sha, used_ref = fetched["content"], fetched["sha"], fetched["ref"]
-    parsed = extract_dependencies(content)
+    parsed = extract_dependencies(content, file_path=file)
 
     start, end = (page - 1) * limit, (page - 1) * limit + limit
     paged = parsed["dependencies"][start:end]
@@ -288,6 +342,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
     BFS recursion: expands dependencies up to max_depth internally.
     - Normalizes lcl/lclmss prefixes but preserves 'mss'
     - Filters kernel/system noise so we don't chase junk symbols
+    - Adds implicit CRUD for Form DataSource tables (table-level methods triggered by kernel on save)
     - Handles errors per-node to avoid request-wide 500s
     Body:
       {
