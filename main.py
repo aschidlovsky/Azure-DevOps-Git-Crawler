@@ -140,6 +140,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 # LIGHTWEIGHT PARSER (with kernel/system filtering + Form DS implicit CRUD)
 # ------------------------------------------------------------
 DEPENDENCY_PATTERNS = [
+    # Keep broad pattern for back-compat; validation gate will filter junk
     (r"\b(select|insert|update|delete)\s+(\w+)", "Table", "statement"),
     (r"\b(\w+)\.DataSource\(", "Table", "DataSource()"),
     (r"\b(\w+)::(construct|new|run)\b", "Class", "static-call"),
@@ -184,6 +185,27 @@ TYPE_PATHS = {
 def _looks_like_form_path(file_path: str) -> bool:
     return file_path.startswith("Forms/") or (file_path.lower().endswith(".xpo") and "/forms/" in file_path.lower())
 
+# ---------- NEW: Symbol validation (filters false positives) ----------
+# Accept only identifiers that look like AX objects:
+#   - Start with uppercase (e.g., PurchLine, SalesTable, InventTrans)
+#   - Or start with "mss" (your prefix), case-insensitive
+ALLOWED_SYMBOL = re.compile(r"^(?:[A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})$")
+
+# Extra junk tokens seen in logs that should never be promoted to objects
+EXTRA_SKIP = {
+    "override", "method", "methods", "reservation", "buffer",
+    "forupdate", "localinventtrans", "maxof", "minof", "sales",
+    "_salesline", "_inventtrans", "_tmpfrmvirtual", "mapmovement", "mapmovementissue"
+}
+
+def is_valid_symbol(symbol: str) -> bool:
+    if not symbol:
+        return False
+    s = symbol.strip()
+    if s.lower() in KERNEL_SKIP or s.lower() in EXTRA_SKIP:
+        return False
+    return bool(ALLOWED_SYMBOL.match(s))
+
 def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
     deps: List[Dict[str, Any]] = []
     implicit: List[Dict[str, Any]] = []
@@ -195,6 +217,9 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         for m in re.finditer(pattern, content, re.IGNORECASE):
             symbol = m.group(2) if reason == "statement" else m.group(1)
             if not symbol:
+                continue
+            # NEW: reject non-AX-ish or obvious junk identifiers
+            if not is_valid_symbol(symbol):
                 continue
             if symbol in KERNEL_SKIP:
                 continue
@@ -209,7 +234,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     # Explicit CRUD calls found in code
     for m in CRUD_SIGNATURE.finditer(content):
         table_sym = m.group(1)
-        if table_sym and table_sym not in KERNEL_SKIP and len(table_sym) >= 3:
+        if table_sym and is_valid_symbol(table_sym) and table_sym not in KERNEL_SKIP and len(table_sym) >= 3:
             implicit.append({
                 "table": table_sym,
                 "method": m.group(2) + "()",
@@ -224,7 +249,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         for p in FORM_DS_PATTERNS:
             for mm in re.finditer(p, content, re.IGNORECASE):
                 sym = mm.group(1)
-                if not sym:
+                if not sym or not is_valid_symbol(sym):
                     continue
                 if sym in KERNEL_SKIP or len(sym) < 3:
                     continue
@@ -275,6 +300,9 @@ def _should_skip_dep_path(p: str) -> bool:
         return True
     folder, symbol = m.group(1), m.group(2)
     if folder not in ALLOWED_FOLDERS:
+        return True
+    # NEW: enforce valid AX-like symbol form
+    if not is_valid_symbol(symbol):
         return True
     if symbol in KERNEL_SKIP:
         return True
@@ -655,6 +683,7 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
     visited_list = sorted(list(visited))
 
     # --------- 2) analyze (bounded concurrency, deadline-aware) ----------
+    from asyncio import Semaphore
     sem = Semaphore(max_conc)
     async def _guarded_analyze(p: str):
         if _deadline_expired(deadline):
