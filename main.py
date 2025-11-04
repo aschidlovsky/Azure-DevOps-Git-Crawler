@@ -1,5 +1,5 @@
 import os, base64, re, json, logging, asyncio
-from typing import Dict, Any, List, Set, Tuple, Optional
+from typing import Dict, Any, List, Set, Optional
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -7,7 +7,7 @@ import httpx
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.7")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,10 +39,11 @@ def get_env() -> Dict[str, str]:
     }
 
 def ado_headers(pat: str) -> Dict[str, str]:
+    # Azure DevOps requires a non-empty username for PAT-based auth
     basic = base64.b64encode(f"pat:{pat}".encode()).decode()
     return {
         "Authorization": f"Basic {basic}",
-        "X-TFS-FedAuthRedirect": "Suppress",
+        "X-TFS-FedAuthRedirect": "Suppress",  # avoid login redirects
         "Accept": "application/json",
         "User-Agent": "ado-git-crawler/1.0",
     }
@@ -54,41 +55,32 @@ def ado_base(env: Dict[str, str]) -> str:
 # HEALTH CHECK
 # ------------------------------------------------------------
 @app.get("/health")
-async def health_root():
-    return {"status": "ok"}
-
 @app.get("/health/")
-async def health_trailing():
+async def health():
     return {"status": "ok"}
 
 # ------------------------------------------------------------
-# FETCH FILE CONTENT FROM ADO (includes HEAD→default fix)
+# FETCH FILE CONTENT FROM ADO
 # ------------------------------------------------------------
 async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     env = get_env()
     base = ado_base(env)
-
-    # Normalize HEAD → env default
-    used_ref = ref or env["REF"]
-    if str(used_ref).upper() == "HEAD":
-        used_ref = env["REF"]
-
     params = {
         "path": f"/{path}" if not path.startswith("/") else path,
-        "versionDescriptor.version": used_ref,
+        "versionDescriptor.version": ref or env["REF"],
         "includeContent": "true",
         "api-version": env["API"],
     }
+    url = f"{base}/items"
 
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(f"{base}/items", headers=ado_headers(env["PAT"]), params=params)
+        r = await client.get(url, headers=ado_headers(env["PAT"]), params=params)
 
-        # Auth/redirect guard
         if r.status_code == 302 or "text/html" in r.headers.get("content-type", ""):
-            raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
+            raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid or unauthorized")
 
         if r.status_code == 404:
-            raise HTTPException(404, f"File not found in ADO: {path}@{used_ref}")
+            raise HTTPException(404, f"File not found in ADO: {path}@{ref or env['REF']}")
 
         try:
             r.raise_for_status()
@@ -98,13 +90,12 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         try:
             data = r.json()
         except Exception:
-            raise HTTPException(502, "Azure DevOps returned non-JSON content (likely auth redirect).")
+            raise HTTPException(502, "Azure DevOps returned non-JSON (likely auth redirect or proxy page).")
 
         content = data.get("content")
         if not content:
             raise HTTPException(404, "No content found for this path (might be binary or empty).")
 
-        # Base64 → text if needed
         try:
             content = base64.b64decode(content).decode("utf-8")
         except Exception:
@@ -113,7 +104,7 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         return {
             "content": content,
             "sha": data.get("objectId") or data.get("commitId") or "unknown",
-            "ref": used_ref,
+            "ref": ref or env["REF"],
         }
 
 # ------------------------------------------------------------
@@ -126,64 +117,32 @@ DEPENDENCY_PATTERNS = [
     (r"\bnew\s+(\w+)\s*\(", "Class", "new"),
     (r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", "Table", "crud-call"),
 ]
+
 CRUD_SIGNATURE = re.compile(r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", re.IGNORECASE)
-
 KERNEL_SKIP = {"FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase"}
-STOPWORDS = {
-    "forupdate", "firstonly", "firstfast", "nofetch", "index", "group", "order", "by", "asc", "desc",
-    "exists", "notexists", "outer", "join", "where", "like", "as", "from", "to", "cross", "container",
-    "this", "the", "super", "true", "false", "null", "element", "display", "edit",
-    "recid", "tableid", "fieldid",
-    "map",  # avoid Classes/Map.xpo false positive
-}
-TYPE_DIR = {"Table": "Tables", "Class": "Classes", "Form": "Forms", "Map": "Maps"}
-
-def normalize_symbol(symbol: str) -> str:
-    """Strip leading 'lcl'/'Lcl' when it denotes a local stub (e.g., lclPurchLine -> PurchLine)."""
-    if len(symbol) > 3 and symbol[:3].lower() == "lcl" and symbol[3].isupper():
-        return symbol[3:]
-    return symbol
-
-def default_path_for(symbol: str, kind: str) -> str:
-    folder = TYPE_DIR.get(kind, "UNKNOWN")
-    return f"{folder}/{symbol}.xpo"
-
-def is_noise_symbol(symbol: str) -> bool:
-    s = symbol.lower()
-    if s in STOPWORDS:
-        return True
-    if len(s) <= 2:
-        return True
-    return False
 
 def extract_dependencies(content: str) -> Dict[str, Any]:
-    deps: List[Dict[str, Any]] = []
-    implicit: List[Dict[str, Any]] = []
-    business: List[Dict[str, Any]] = []
-    seen: Set[Tuple[str, str]] = set()  # (kind, normalized_symbol)
+    deps, implicit, business = [], [], []
 
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
         for m in re.finditer(pattern, content, re.IGNORECASE):
-            raw = m.group(2) if reason == "statement" else m.group(1)
-            if not raw:
+            symbol = m.group(2) if reason == "statement" else m.group(1)
+            if symbol in KERNEL_SKIP:
                 continue
-            if raw in KERNEL_SKIP or is_noise_symbol(raw):
-                continue
-            sym = normalize_symbol(raw)
-            key = (kind, sym)
-            if key in seen:
-                continue
-            seen.add(key)
             deps.append({
-                "path": default_path_for(sym, kind),
+                "path": f"{kind}s/{symbol}.xpo",
                 "type": kind,
-                "symbol": sym,  # normalized
+                "symbol": symbol,
                 "reason": reason
             })
 
     for m in CRUD_SIGNATURE.finditer(content):
-        tbl = normalize_symbol(m.group(1))
-        implicit.append({"table": tbl, "method": m.group(2) + "()", "caller": "unknown", "line": m.start()})
+        implicit.append({
+            "table": m.group(1),
+            "method": m.group(2) + "()",
+            "caller": "unknown",
+            "line": m.start()
+        })
 
     for ln, line in enumerate(content.splitlines(), start=1):
         if any(k in line for k in ["validate", "error(", "ttsBegin", "ttsCommit"]):
@@ -195,15 +154,8 @@ def extract_dependencies(content: str) -> Dict[str, Any]:
 # ENDPOINT: /file
 # ------------------------------------------------------------
 @app.get("/file")
-async def file_get(
-    path: str = Query(..., description="Repo path (e.g., Forms/CustTable.xpo)"),
-    ref: Optional[str] = Query(None),
-):
-    data = await get_item_content(path, ref)
-    return {"path": path, "ref": data["ref"], "sha": data["sha"], "content": data["content"]}
-
 @app.get("/file/")
-async def file_get_trailing(
+async def file_get(
     path: str = Query(..., description="Repo path (e.g., Forms/CustTable.xpo)"),
     ref: Optional[str] = Query(None),
 ):
@@ -214,6 +166,7 @@ async def file_get_trailing(
 # ENDPOINT: /deps (single-hop)
 # ------------------------------------------------------------
 @app.get("/deps")
+@app.get("/deps/")
 async def deps_get(
     file: str = Query(..., description="Repo path to .xpo file"),
     ref: Optional[str] = Query(None),
@@ -236,7 +189,7 @@ async def deps_get(
         "dependencies": paged,
         "business_rules": parsed["business_rules"],
         "implicit_crud": parsed["implicit_crud"],
-        "unresolved": [d for d in parsed["dependencies"] if d["path"].startswith("UNKNOWN/")],
+        "unresolved": [d for d in parsed["dependencies"] if not os.path.exists(d["path"])],
         "visited": [file],
         "skipped": [],
         "page": page,
@@ -245,19 +198,11 @@ async def deps_get(
         "total_pages": total_pages,
     }
 
-@app.get("/deps/")
-async def deps_get_trailing(
-    file: str = Query(..., description="Repo path to .xpo file"),
-    ref: Optional[str] = Query(None),
-    page: int = 1,
-    limit: int = 200,
-):
-    return await deps_get(file=file, ref=ref, page=page, limit=limit)
-
 # ------------------------------------------------------------
-# ENDPOINT: /resolve (recursive multi-hop expansion)
+# ENDPOINT: /resolve (recursive multi-hop)
 # ------------------------------------------------------------
 @app.post("/resolve")
+@app.post("/resolve/")
 async def resolve_post(payload: Dict[str, Any] = Body(...)):
     """
     BFS recursion: expands dependencies up to max_depth internally.
@@ -293,7 +238,6 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
 
-        # parallel fetch
         results = await asyncio.gather(*[safe_deps(f) for f in level_files])
 
         next_level: List[str] = []
@@ -306,15 +250,15 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
                 continue
 
             dep_paths: List[str] = []
-                for d in deps:
-                    raw = d.get("path") or ""
-                    # Normalize "lcl" prefix (including 'lclmss' variants) but keep 'mss'
-                    clean = re.sub(
-                        r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
-                        lambda m: f"{m.group(1)}{(m.group(3) or '')}{m.group(4)}",
-                        raw,
-                    )
-                    dep_paths.append(clean)
+            for d in deps:
+                raw = d.get("path") or ""
+                # Normalize "lcl" prefix (including 'lclmss' variants) but keep 'mss'
+                clean = re.sub(
+                    r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
+                    lambda m: f"{m.group(1)}{(m.group(3) or '')}{m.group(4)}",
+                    raw,
+                )
+                dep_paths.append(clean)
             graph.append({
                 "file": file,
                 "depth": depth,
