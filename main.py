@@ -1,17 +1,14 @@
-import os, base64, re, json, logging, asyncio, time
+import os, base64, re, json, logging, asyncio
 from typing import Dict, Any, List, Set, Optional, Tuple
-from contextlib import asynccontextmanager
-
-import httpx
-from fastapi import FastAPI, HTTPException, Query, Body, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 from asyncio import Semaphore
 
 # ------------------------------------------------------------
 # APP INITIALIZATION
 # ------------------------------------------------------------
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.6.0")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,27 +46,11 @@ def ado_headers(pat: str) -> Dict[str, str]:
         "Authorization": f"Basic {basic}",
         "X-TFS-FedAuthRedirect": "Suppress",
         "Accept": "application/json",
-        "User-Agent": "ado-git-crawler/1.6",
+        "User-Agent": "ado-git-crawler/1.0",
     }
 
 def ado_base(env: Dict[str, str]) -> str:
     return f"https://dev.azure.com/{env['ORG']}/{env['PROJECT']}/_apis/git/repositories/{env['REPO']}"
-
-# ------------------------------------------------------------
-# GLOBAL EXCEPTION HANDLER (safety net)
-# ------------------------------------------------------------
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    log.exception("Unhandled exception")
-    return JSONResponse(status_code=500, content={"error": "internal_error", "message": str(exc)[:300]})
-
-# ------------------------------------------------------------
-# SHARED HTTPX CLIENT (no redirects; reuse connections)
-# ------------------------------------------------------------
-@asynccontextmanager
-async def shared_client(timeout=60):
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        yield client
 
 # ------------------------------------------------------------
 # HEALTH CHECK
@@ -100,12 +81,11 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 
     log.info(f"[get_item_content] path={params['path']} ref={used_ref}")
 
-    async with shared_client(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         r = await client.get(url, headers=ado_headers(env["PAT"]), params=params)
 
-        # Guard against redirects and HTML (login or proxy pages)
-        ctype = r.headers.get("content-type", "")
-        if r.status_code in (301, 302, 303, 307, 308) or "text/html" in ctype:
+        # Guard against HTML login redirects
+        if r.status_code == 302 or "text/html" in (r.headers.get("content-type") or ""):
             raise HTTPException(401, "Azure DevOps authentication failed – PAT invalid, expired, or unauthorized")
 
         if r.status_code == 404:
@@ -138,17 +118,17 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
         }
 
 # ------------------------------------------------------------
-# LIGHTWEIGHT PARSER (kernel/system filter + Form DS implicit CRUD)
+# LIGHTWEIGHT PARSER (with kernel/system filtering + Form DS implicit CRUD)
 # ------------------------------------------------------------
 DEPENDENCY_PATTERNS = [
-    # Prefer table refs via from/join to avoid EDT/field names
-    (r"\b(from|join)\s+([A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})\b", "Table", "from-join"),
+    (r"\b(select|insert|update|delete)\s+(\w+)", "Table", "statement"),
     (r"\b(\w+)\.DataSource\(", "Table", "DataSource()"),
     (r"\b(\w+)::(construct|new|run)\b", "Class", "static-call"),
     (r"\bnew\s+(\w+)\s*\(", "Class", "new"),
-    (r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", "Table", "crud-call"),
+    (r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete|write)\s*\(", "Table", "crud-call"),
 ]
 
+# Form DS extraction patterns (various XPO shapes)
 FORM_DS_PATTERNS = [
     r"\bOBJECT\s+FORM\s+DATASOURCE\s+(\w+)",
     r"\bDATA\s+SOURCE\s+NAME\s*:\s*(\w+)",
@@ -159,9 +139,11 @@ FORM_DS_PATTERNS = [
 ]
 
 CRUD_SIGNATURE = re.compile(
-    r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(", re.IGNORECASE
+    r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete|write)\s*\(",
+    re.IGNORECASE
 )
 
+# Expanded skip: kernel/system names & common false positives
 KERNEL_SKIP = {
     # Kernel/system
     "FormRun", "Args", "Set", "SetEnumerator", "Global", "QueryBuildDataSource", "RunBase",
@@ -175,6 +157,12 @@ KERNEL_SKIP = {
     "exists", "update_recordset", "delete_from", "insert_recordset"
 }
 
+# Additional symbols that are usually metadata/framework (tend to 404 in custom repos)
+LIKELY_KERNEL_META_PREFIXES = ("Dict", "ImageListAppl_", "Menu", "MenuFunction", "Label")
+LIKELY_KERNEL_META_EXACT = {
+    "DictTable", "DictField", "DictEnum", "DictRelation", "DictType", "Label"
+}
+
 TYPE_PATHS = {
     "Table": "Tables",
     "Class": "Classes",
@@ -183,217 +171,80 @@ TYPE_PATHS = {
     "Unknown": "Unknown"
 }
 
+ALLOWED_FOLDERS = {"Tables", "Classes", "Forms", "Maps"}
+
+# ------------------------------------------------------------
+# Invocation extraction (form & DS methods → called targets)
+# ------------------------------------------------------------
+METHOD_HEADER = re.compile(
+    r"\b(BEGINMETHOD\s+)?(?P<name>(init|run|closeOk|close|clicked|modified|active|write|validateWrite|validateDelete))\s*\(",
+    re.IGNORECASE
+)
+DS_METHOD_REGION = re.compile(
+    r"\bOBJECT\s+FORM\s+DATASOURCE\b.*?\bMETHODS\b(?P<body>.*?)\bENDMETHODS\b",
+    re.IGNORECASE | re.DOTALL
+)
+CALL_SITE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.MULTILINE)
+INTERESTING_TARGET = re.compile(r"\b(mss[A-Za-z0-9_]*Comparer|completeAckConfirm|initAck|acceptPrices)\b")
+
+def _extract_invocation_paths(content: str) -> List[Dict[str, Any]]:
+    """
+    Heuristic: find entrypoint-like methods, then list notable calls inside.
+    Returns: [{"entry": "init()", "calls": ["initAck()", "mssBDAckTableComparer::..."]}, ...]
+    """
+    invocations: List[Dict[str, Any]] = []
+
+    def scan_block(block_text: str, entry_label_prefix: str = ""):
+        for m in METHOD_HEADER.finditer(block_text):
+            entry = m.group("name")
+            start = m.start()
+            next_m = METHOD_HEADER.search(block_text, pos=m.end())
+            end = next_m.start() if next_m else len(block_text)
+            body = block_text[start:end]
+
+            calls: List[str] = []
+            for cm in CALL_SITE.finditer(body):
+                callee = cm.group(1)
+                if INTERESTING_TARGET.search(callee):
+                    calls.append(callee + "()")
+
+            if calls:
+                label = f"{entry_label_prefix}{entry}()"
+                seen = set()
+                ordered = []
+                for c in calls:
+                    if c not in seen:
+                        seen.add(c)
+                        ordered.append(c)
+                invocations.append({"entry": label, "calls": ordered})
+
+    # 1) Top-level form methods
+    scan_block(content, entry_label_prefix="")
+    # 2) DataSource method regions
+    for dsm in DS_METHOD_REGION.finditer(content):
+        ds_body = dsm.group("body") or ""
+        scan_block(ds_body, entry_label_prefix="DataSource.")
+    return invocations
+
+# ------------------------------------------------------------
+# HELPERS: path normalization, filtering, and reclassification retries
+# ------------------------------------------------------------
 def _looks_like_form_path(file_path: str) -> bool:
     return file_path.startswith("Forms/") or (file_path.lower().endswith(".xpo") and "/forms/" in file_path.lower())
 
-# ---------- Symbol validation ----------
-ALLOWED_SYMBOL = re.compile(r"^(?:[A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})$")
-
-# XPO/property tokens and other junk we never want as objects
-EXTRA_SKIP = {
-    "override", "method", "methods", "reservation", "buffer",
-    "forupdate", "localinventtrans", "maxof", "minof", "sales",
-    "_salesline", "_inventtrans", "_tmpfrmvirtual", "mapmovement", "mapmovementissue",
-    "endproperties", "properties", "objectpool", "datasource",
-    "name", "table", "allowcreate", "allowdelete", "allowedit",
-    "modelwithoptions", "modelwithoption", "options"
-}
-
-# Framework/utility prefix block to cut fan-out + 404s
-FRAMEWORK_PREFIXES = (
-    "Dict", "Sys", "ImageListAppl_", "Dialog", "ExecutePermission",
-    "ListIterator", "Xml", "MapIterator", "Ledger", "CustVendPaymSched",
-    "PriceDisc", "SalesTotals", "SalesCalcTax"
-)
-
-def is_valid_symbol(symbol: str) -> bool:
-    if not symbol:
+EDT_LIKE_SUFFIXES = ("Id", "Qty", "Price", "Amount", "Code", "Group", "TypeId")
+def _looks_like_edt_name(symbol: str) -> bool:
+    # coarse heuristic: starts uppercase, short-ish, and ends like an EDT
+    if not symbol or len(symbol) < 3:
         return False
-    s = symbol.strip()
-    low = s.lower()
-    if low in KERNEL_SKIP or low in EXTRA_SKIP:
+    if not symbol[0].isalpha() or not symbol[0].isupper():
         return False
-    if any(s.startswith(p) for p in FRAMEWORK_PREFIXES):
-        return False
-    if s.isupper():  # filters ENDPROPERTIES, SMD, etc.
-        return False
-    return bool(ALLOWED_SYMBOL.match(s))
-
-# ---------- variable → type binding ----------
-DECLARATION_SIG = re.compile(
-    r"\b([A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})\s+([a-z][A-Za-z0-9_]*)\s*;", re.MULTILINE
-)
-
-def _collect_var_types(content: str) -> Dict[str, str]:
-    """Map lowercase buffer names -> PascalCase type (e.g., purchTable -> PurchTable)."""
-    types: Dict[str, str] = {}
-    for m in DECLARATION_SIG.finditer(content):
-        typ, var = m.group(1), m.group(2)
-        if is_valid_symbol(typ):
-            types[var] = typ
-    return types
-
-# ---------- Parse Form DataSource PROPERTIES blocks ----------
-DS_BLOCK = re.compile(
-    r"\bDATASOURCE\b.*?\bPROPERTIES\b(.*?)\bENDPROPERTIES\b",
-    re.IGNORECASE | re.DOTALL
-)
-
-def _parse_form_datasources(content: str) -> List[Dict[str, Optional[str]]]:
-    results: List[Dict[str, Optional[str]]] = []
-    for m in DS_BLOCK.finditer(content):
-        props = m.group(1)
-
-        def _find_str(name: str) -> Optional[str]:
-            mm = re.search(rf"\b{name}\b\s*[:=]?\s*#?([A-Za-z0-9_]+)", props, re.IGNORECASE)
-            return mm.group(1) if mm else None
-
-        def _find_bool(name: str) -> Optional[bool]:
-            mm = re.search(rf"\b{name}\b\s*[:=]?\s*#?(Yes|No)", props, re.IGNORECASE)
-            if not mm:
-                return None
-            return mm.group(1).lower() == "yes"
-
-        table = _find_str("Table")
-        allow_create = _find_bool("AllowCreate")
-        allow_delete = _find_bool("AllowDelete")
-        allow_edit   = _find_bool("AllowEdit")
-
-        results.append({
-            "table": table,
-            "allow_create": allow_create,
-            "allow_delete": allow_delete,
-            "allow_edit": allow_edit,
-        })
-    return results
-
-def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
-    deps: List[Dict[str, Any]] = []
-    implicit: List[Dict[str, Any]] = []
-    business: List[Dict[str, Any]] = []
-    dep_keys: Set[str] = set()
-
-    # variable type table (for resolving lowercase buffers in CRUD)
-    var_types = _collect_var_types(content)
-
-    # Direct dependency detection (with folder mapping)
-    for pattern, kind, reason in DEPENDENCY_PATTERNS:
-        for m in re.finditer(pattern, content, re.IGNORECASE):
-            symbol = m.group(2) if reason in ("from-join", "statement") else m.group(1)
-            if not symbol:
-                continue
-            if not is_valid_symbol(symbol):
-                continue
-            if symbol in KERNEL_SKIP:
-                continue
-            if len(symbol) < 3:
-                continue
-            folder = TYPE_PATHS.get(kind, "Unknown")
-            path = f"{folder}/{symbol}.xpo"
-            if path not in dep_keys:
-                deps.append({"path": path, "type": kind, "symbol": symbol, "reason": reason})
-                dep_keys.add(path)
-
-    # Explicit CRUD calls found in code (resolve variable -> declared type)
-    for m in CRUD_SIGNATURE.finditer(content):
-        raw_sym = m.group(1)            # could be 'PurchTable' or 'purchTable'
-        method = m.group(2) + "()"      # e.g., update()
-
-        resolved: Optional[str] = None
-        if is_valid_symbol(raw_sym):
-            resolved = raw_sym
-        else:
-            cand = var_types.get(raw_sym)
-            if cand and is_valid_symbol(cand):
-                resolved = cand
-
-        if resolved:
-            implicit.append({
-                "table": resolved,
-                "method": method,
-                "caller": "unknown",
-                "line": m.start()
-            })
-            # Also promote as a dependency edge to the Table
-            table_path = f"Tables/{resolved}.xpo"
-            if table_path not in dep_keys:
-                deps.append({
-                    "path": table_path,
-                    "type": "Table",
-                    "symbol": resolved,
-                    "reason": "crud-call"
-                })
-                dep_keys.add(table_path)
-
-    # Form DS → dependency on the DS Table + CRUD methods gated by Allow* flags
-    is_form = _looks_like_form_path(file_path or "")
-    if is_form:
-        # Prefer explicit PROPERTIES parsing
-        ds_list = _parse_form_datasources(content)
-
-        # Fallback: legacy patterns (kept for compatibility)
-        if not ds_list:
-            legacy_ds: Set[str] = set()
-            for p in FORM_DS_PATTERNS:
-                for mm in re.finditer(p, content, re.IGNORECASE):
-                    sym = mm.group(1)
-                    if sym and is_valid_symbol(sym) and sym not in KERNEL_SKIP and len(sym) >= 3:
-                        legacy_ds.add(sym)
-            ds_list = [{"table": t, "allow_create": None, "allow_delete": None, "allow_edit": None} for t in legacy_ds]
-
-        for ds in ds_list:
-            sym = (ds.get("table") or "").strip()
-            if not sym or not is_valid_symbol(sym):
-                continue
-
-            # Always add the Table dependency for the DS
-            table_path = f"Tables/{sym}.xpo"
-            if table_path not in dep_keys:
-                deps.append({
-                    "path": table_path,
-                    "type": "Table",
-                    "symbol": sym,
-                    "reason": "form-datasource"
-                })
-                dep_keys.add(table_path)
-
-            # Determine allowed CRUD from flags; unspecified ⇒ permissive (include)
-            allow_create = ds.get("allow_create")
-            allow_delete = ds.get("allow_delete")
-            allow_edit   = ds.get("allow_edit")
-
-            methods: List[str] = []
-            if allow_edit is not False:
-                methods.extend(["update()", "validateWrite()", "write()"])
-            if allow_create is not False:
-                methods.append("insert()")
-            if allow_delete is not False:
-                methods.extend(["delete()", "validateDelete()"])
-
-            for method in methods:
-                implicit.append({
-                    "table": sym,
-                    "method": method,
-                    "caller": "FormSaveKernel",
-                    "line": -1,
-                    "reason": "implicit-form-datasource-crud"
-                })
-
-    # Business-rule signals
-    for ln, line in enumerate(content.splitlines(), start=1):
-        if any(k in line for k in ["validate", "error(", "ttsBegin", "ttsCommit"]):
-            business.append({"line": ln, "context": line.strip()[:160]})
-
-    return {"dependencies": deps, "implicit_crud": implicit, "business_rules": business}
-
-# ------------------------------------------------------------
-# FOLLOW-ON FILTERING (re-applies skip rules every hop)
-# ------------------------------------------------------------
-ALLOWED_FOLDERS = {"Tables", "Classes", "Forms", "Maps"}
+    return symbol.endswith(EDT_LIKE_SUFFIXES)
 
 def _should_skip_dep_path(p: str) -> bool:
     """
-    Returns True if this normalized path should be ignored (kernel/system/junk).
+    Returns True if this normalized path should be ignored (kernel/system/junk/EDT-likes).
+    Expects 'Tables/PurchLine.xpo' etc.
     """
     if not p or ".xpo" not in p:
         return True
@@ -403,26 +254,23 @@ def _should_skip_dep_path(p: str) -> bool:
     folder, symbol = m.group(1), m.group(2)
     if folder not in ALLOWED_FOLDERS:
         return True
-    if any(symbol.startswith(pref) for pref in FRAMEWORK_PREFIXES):
-        return True
-    if not is_valid_symbol(symbol):
-        return True
     if symbol in KERNEL_SKIP:
         return True
-    if symbol.lower() in {
-        "sum","avg","min","max","count","len","is","the","for","select","firstonly",
-        "exists","update_recordset","delete_from","insert_recordset","this","super"
-    }:
-        return True
-    if symbol.isupper():
+    if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
         return True
     if len(symbol) < 3:
+        return True
+    # If we ever mis-detected EDTs as Tables, prefer to skip them entirely.
+    if folder == "Tables" and _looks_like_edt_name(symbol):
         return True
     return False
 
 def _normalize_dep_path(p: str) -> str:
     """
-    Strip 'lcl' or 'Lcl' prefix (including 'lclmss') while preserving 'mss'.
+    Strip 'lcl' or 'Lcl' prefix (including 'lclmss') while preserving 'mss'
+    Examples:
+      Tables/lclPurchLine.xpo   -> Tables/PurchLine.xpo
+      Tables/lclmssBDAck.xpo    -> Tables/mssBDAck.xpo   (keep 'mss')
     """
     return re.sub(
         r"(^|/)(lcl|Lcl)(mss)?([A-Z])",
@@ -430,45 +278,132 @@ def _normalize_dep_path(p: str) -> str:
         p or "",
     )
 
-# ---------- FOLDER FALLBACKS (retry on 404/misclassification) ----------
-def _alt_folders_for(folder: str) -> List[str]:
-    order = ["Tables", "Classes", "Forms", "Maps"]
-    return [f for f in order if f != folder]
+def _dep_tuple(dep: Dict[str, Any]) -> Tuple[str, str]:
+    return (dep.get("type") or "", dep.get("symbol") or "")
 
-def _split_folder_symbol(path: str) -> Tuple[Optional[str], Optional[str]]:
-    m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", path or "")
-    if not m:
-        return None, None
-    return m.group(1), m.group(2)
+def _initial_dep_path(kind: str, symbol: str) -> str:
+    folder = TYPE_PATHS.get(kind, "Unknown")
+    return f"{folder}/{symbol}.xpo"
 
-async def _resolve_existing_path_with_fallbacks(path: str, ref: Optional[str]) -> Tuple[str, Optional[str]]:
+def _fallback_kinds_on_404(kind: str, symbol: str) -> List[str]:
     """
-    Try the given path; if 404, attempt same symbol in other folders.
-    Returns (resolved_path, corrected_from) where corrected_from is the original
-    path if a fallback succeeded, else None.
+    If we 404 on the initial guess, try these kinds in order.
+    Key fix: PurchLineType/SalesLineType often detected as Tables, but are Classes.
     """
-    try:
-        await get_item_content(path, ref)
-        return path, None
-    except HTTPException as e:
-        if e.status_code != 404:
-            raise
-        folder, symbol = _split_folder_symbol(path)
-        if not folder or not symbol:
-            raise
-        for alt in _alt_folders_for(folder):
-            candidate = f"{alt}/{symbol}.xpo"
-            try:
-                await get_item_content(candidate, ref)
-                log.info(f"[fallback] {path} -> {candidate}")
-                return candidate, path
-            except HTTPException as ee:
-                if ee.status_code == 404:
+    # Always avoid EDTs (we don't support EDT folders, and they should be filtered)
+    if _looks_like_edt_name(symbol):
+        return []
+
+    fallbacks: List[str] = []
+    if kind == "Table":
+        # If it smells like a Type class, try Class first.
+        if symbol.endswith("Type") or symbol.startswith("Ax") or symbol in {"PriceDisc", "Dialog"}:
+            fallbacks.extend(["Class", "Form", "Map"])
+        else:
+            fallbacks.extend(["Class", "Form", "Map"])
+    elif kind == "Class":
+        fallbacks.extend(["Table", "Form", "Map"])
+    elif kind == "Form":
+        fallbacks.extend(["Class", "Table", "Map"])
+    else:
+        fallbacks.extend(["Class", "Table", "Form", "Map"])
+    return fallbacks
+
+# ------------------------------------------------------------
+# CORE EXTRACTOR
+# ------------------------------------------------------------
+def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
+    deps: List[Dict[str, Any]] = []
+    implicit: List[Dict[str, Any]] = []
+    business: List[Dict[str, Any]] = []
+    dep_keys: Set[str] = set()
+
+    # Direct dependency detection (with folder mapping)
+    for pattern, kind, reason in DEPENDENCY_PATTERNS:
+        for m in re.finditer(pattern, content, re.IGNORECASE):
+            symbol = m.group(2) if reason == "statement" else m.group(1)
+            if not symbol:
+                continue
+            if symbol in KERNEL_SKIP:
+                continue
+            if len(symbol) < 3:
+                continue
+
+            # Skip likely kernel/meta early
+            if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
+                continue
+            # Skip likely EDTs early if detected as Table by the "statement" rule
+            if kind == "Table" and _looks_like_edt_name(symbol):
+                continue
+
+            folder = TYPE_PATHS.get(kind, "Unknown")
+            path = f"{folder}/{symbol}.xpo"
+            if path not in dep_keys:
+                deps.append({"path": path, "type": kind, "symbol": symbol, "reason": reason})
+                dep_keys.add(path)
+
+    # Explicit CRUD calls found in code
+    for m in CRUD_SIGNATURE.finditer(content):
+        table_sym = m.group(1)
+        if table_sym and table_sym not in KERNEL_SKIP and len(table_sym) >= 3:
+            implicit.append({
+                "table": table_sym,
+                "method": m.group(2) + "()",
+                "caller": "unknown",
+                "line": m.start()
+            })
+
+    # Form DS → implicit dependencies + implicit CRUD on save
+    is_form = _looks_like_form_path(file_path or "")
+    if is_form:
+        ds_tables: Set[str] = set()
+        for p in FORM_DS_PATTERNS:
+            for mm in re.finditer(p, content, re.IGNORECASE):
+                sym = mm.group(1)
+                if not sym:
                     continue
-                else:
-                    raise
-        # not found anywhere → propagate original 404
-        raise
+                if sym in KERNEL_SKIP or len(sym) < 3:
+                    continue
+                # Filter out EDT-ish names that occasionally appear in DS blocks
+                if _looks_like_edt_name(sym):
+                    continue
+                ds_tables.add(sym)
+
+        if ds_tables:
+            for sym in ds_tables:
+                table_path = f"Tables/{sym}.xpo"
+                if table_path not in dep_keys:
+                    deps.append({
+                        "path": table_path,
+                        "type": "Table",
+                        "symbol": sym,
+                        "reason": "form-datasource"
+                    })
+                    dep_keys.add(table_path)
+
+            for sym in ds_tables:
+                for method in ["insert()", "update()", "delete()", "validateWrite()", "write()", "validateDelete()"]:
+                    implicit.append({
+                        "table": sym,
+                        "method": method,
+                        "caller": "FormSaveKernel",
+                        "line": -1,
+                        "reason": "implicit-form-datasource-crud"
+                    })
+
+    # Business-rule signals
+    for ln, line in enumerate(content.splitlines(), start=1):
+        if any(k in line for k in ["validate", "error(", "ttsBegin", "ttsCommit"]):
+            business.append({"line": ln, "context": line.strip()[:160]})
+
+    invocations = _extract_invocation_paths(content)
+
+    return {
+        "dependencies": deps,
+        "implicit_crud": implicit,
+        "business_rules": business,
+        "invocation_paths": invocations
+    }
 
 # ------------------------------------------------------------
 # ENDPOINT: /file
@@ -483,7 +418,7 @@ async def file_get(
     return {"path": path, "ref": data["ref"], "sha": data["sha"], "content": data["content"]}
 
 # ------------------------------------------------------------
-# ENDPOINT: /deps (single-hop) with internal parse
+# ENDPOINT: /deps (single-hop)
 # ------------------------------------------------------------
 @app.get("/deps")
 @app.get("/deps/")
@@ -509,6 +444,7 @@ async def deps_get(
         "dependencies": paged,
         "business_rules": parsed["business_rules"],
         "implicit_crud": parsed["implicit_crud"],
+        "invocation_paths": parsed.get("invocation_paths", []),
         "unresolved": [],
         "visited": [file],
         "skipped": [],
@@ -519,14 +455,100 @@ async def deps_get(
     }
 
 # ------------------------------------------------------------
-# ENDPOINT: /resolve (recursive multi-hop BFS) with fallback retry
+# INTERNAL: safe deps_get with 404 reclassification + filtering
+# ------------------------------------------------------------
+async def _safe_deps_normalized(file: str, used_ref: str) -> Dict[str, Any]:
+    """
+    Calls deps_get for a 'file' path. If 404, attempts to reclassify the symbol
+    across alternative folders (Table→Class, etc.). Applies normalization + skip filter.
+    Returns: {"file": <original>, "deps": [normalized dep dicts], "implicit": [...],
+              "business": [...], "invocations": [...], "error": None or str}
+    """
+    async def _attempt(path: str) -> Optional[Dict[str, Any]]:
+        try:
+            node = await deps_get(file=path, ref=used_ref, page=1, limit=200)  # type: ignore
+            return node
+        except HTTPException as he:
+            if he.status_code == 404:
+                return None
+            raise
+        except Exception:
+            return None
+
+    # First try original
+    node = await _attempt(file)
+    tried_paths = [file]
+
+    # If we failed, try reclassification based on symbol/kind
+    if node is None:
+        m = re.match(r"^(Tables|Classes|Forms|Maps)/([^/]+)\.xpo$", file)
+        if m:
+            orig_folder, symbol = m.group(1), m.group(2)
+            # Skip kernel/meta or EDT-ish misses outright
+            if symbol.startswith(LIKELY_KERNEL_META_PREFIXES) or symbol in LIKELY_KERNEL_META_EXACT:
+                return {"file": file, "deps": [], "implicit": [], "business": [], "invocations": [], "error": None}
+
+            if _looks_like_edt_name(symbol):
+                return {"file": file, "deps": [], "implicit": [], "business": [], "invocations": [], "error": None}
+
+            # compute kind
+            inv_kind = None
+            for k, folder in TYPE_PATHS.items():
+                if folder == orig_folder:
+                    inv_kind = k
+                    break
+            kinds_to_try = _fallback_kinds_on_404(inv_kind or "Unknown", symbol)
+            for k in kinds_to_try:
+                alt = f"{TYPE_PATHS.get(k, 'Unknown')}/{symbol}.xpo"
+                if alt in tried_paths:
+                    continue
+                node = await _attempt(alt)
+                tried_paths.append(alt)
+                if node is not None:
+                    break
+
+    # If still nothing, return empty set (not an error)
+    if node is None:
+        return {"file": file, "deps": [], "implicit": [], "business": [], "invocations": [], "error": None}
+
+    # Normalize & filter deps for this node
+    norm_deps: List[Dict[str, Any]] = []
+    for d in node.get("dependencies", []) or []:
+        raw = d.get("path") or ""
+        clean = _normalize_dep_path(raw)
+        if _should_skip_dep_path(clean):
+            continue
+        nd = dict(d)
+        nd["path"] = clean
+        norm_deps.append(nd)
+
+    return {
+        "file": file,
+        "deps": norm_deps,
+        "implicit": node.get("implicit_crud", []) or [],
+        "business": node.get("business_rules", []) or [],
+        "invocations": node.get("invocation_paths", []) or [],
+        "error": None
+    }
+
+# ------------------------------------------------------------
+# ENDPOINT: /resolve (recursive multi-hop BFS)
 # ------------------------------------------------------------
 @app.post("/resolve")
 @app.post("/resolve/")
 async def resolve_post(payload: Dict[str, Any] = Body(...)):
     """
     BFS recursion: expands dependencies up to max_depth internally.
-    Includes retry fallbacks for misclassified folders (Tables↔Classes↔Forms↔Maps).
+    - Normalizes lcl/lclmss prefixes but preserves 'mss'
+    - Filters kernel/system noise each hop
+    - Adds implicit CRUD for Form DS tables
+    - Handles per-node errors without failing the whole request
+    Body:
+      {
+        "start_file": "Forms/mssBDAckTableFurn.xpo",
+        "ref": "main",
+        "max_depth": 5
+      }
     """
     env = get_env()
     start_file: str = payload.get("start_file")
@@ -544,58 +566,27 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
     current_level: List[str] = [start_file]
     depth = 0
 
-    async def deps_get_with_fallback(file: str, ref: Optional[str]):
-        try:
-            node = await deps_get(file=file, ref=ref, page=1, limit=200)  # type: ignore
-            return file, node
-        except HTTPException as e:
-            if e.status_code != 404:
-                raise
-            # try alternatives
-            folder, symbol = _split_folder_symbol(file)
-            if not folder or not symbol:
-                raise
-            for alt in _alt_folders_for(folder):
-                candidate = f"{alt}/{symbol}.xpo"
-                try:
-                    node = await deps_get(file=candidate, ref=ref, page=1, limit=200)  # type: ignore
-                    log.info(f"[resolve.fallback] {file} -> {candidate}")
-                    return candidate, node
-                except HTTPException as ee:
-                    if ee.status_code == 404:
-                        continue
-                    else:
-                        raise
-            # propagate original 404 if no alt works
-            raise
-
     while current_level and depth < max_depth:
         log.info(f"[resolve] Depth {depth}: {len(current_level)} files")
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
 
-        results = await asyncio.gather(*[deps_get_with_fallback(f, used_ref) for f in level_files], return_exceptions=True)
+        results = await asyncio.gather(*[_safe_deps_normalized(f, used_ref) for f in level_files])
 
         next_level: List[str] = []
         for res in results:
-            if isinstance(res, Exception):
-                # Unable to resolve this node
-                graph.append({"file": "unknown", "error": str(res), "depth": depth, "dependencies": []})
+            file = res["file"]
+            err = res.get("error")
+            deps = res.get("deps") or []
+            implicit_all.extend(res.get("implicit", []))
+
+            if err:
+                graph.append({"file": file, "error": err, "depth": depth, "dependencies": []})
                 continue
 
-            real_file, node = res  # corrected path (may equal original), deps payload
-            implicit_all.extend(node.get("implicit_crud", []))
-
-            dep_paths: List[str] = []
-            for d in node.get("dependencies", []):
-                raw = d.get("path") or ""
-                clean = _normalize_dep_path(raw)
-                if _should_skip_dep_path(clean):
-                    continue
-                dep_paths.append(clean)
-
+            dep_paths: List[str] = [d["path"] for d in deps]
             graph.append({
-                "file": real_file,
+                "file": file,
                 "depth": depth,
                 "dependencies": dep_paths,
                 "error": None
@@ -603,7 +594,7 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
             next_level.extend(dep_paths)
 
         depth += 1
-        current_level = [f for f in dict.fromkeys(next_level) if f not in visited]
+        current_level = [f for f in set(next_level) if f not in visited]
 
     return {
         "root": start_file,
@@ -618,320 +609,127 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
     }
 
 # ------------------------------------------------------------
-# HELPERS: deadlines, budgeted responses for /report
+# INTERNAL: analyze a single file for /report
 # ------------------------------------------------------------
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-def _deadline_expired(deadline_ms: int) -> bool:
-    return _now_ms() >= deadline_ms
-
-def _time_left(deadline_ms: int) -> int:
-    return max(0, deadline_ms - _now_ms())
-
-def _shrink_report_for_budget(result: Dict[str, Any], budget_bytes: int) -> Dict[str, Any]:
+async def _analyze_single_file(path: str, ref: Optional[str], used_ref: str) -> Dict[str, Any]:
     """
-    Iteratively trims big arrays until the utf-8 JSON is under budget.
-    Preserves structure and types; only reduces list lengths / long strings.
+    Fetches content (/file) and direct analysis (/deps) for a single path.
+    Returns a compact dict used by /report aggregation.
+    Applies reclassification retries and normalization.
     """
-    def size(d: Dict[str, Any]) -> int:
-        return len(json.dumps(d, ensure_ascii=False).encode("utf-8"))
-
-    if size(result) <= budget_bytes:
-        return result
-
-    r = dict(result)
-    arrays = ["objects", "edges", "graph", "business_rules", "implicit_crud", "visited"]
-    trim_steps = [0.5, 0.25, 0.1]
-
-    # Drop non-essential heavy keys inside objects (keep id fields)
-    if "objects" in r and isinstance(r["objects"], list):
-        for o in r["objects"]:
-            if isinstance(o, dict):
-                for k in list(o.keys()):
-                    if k not in ("path", "ref", "sha", "depth", "error"):
-                        o.pop(k, None)
-    if size(r) <= budget_bytes:
-        return r
-
-    # Trim arrays progressively
-    for step in trim_steps:
-        for key in arrays:
-            if key in r and isinstance(r[key], list) and len(r[key]) > 0:
-                keep = max(25, int(len(r[key]) * step))
-                r[key] = r[key][:keep]
-        # shorten business_rule context strings
-        if "business_rules" in r and isinstance(r["business_rules"], list):
-            for br in r["business_rules"]:
-                if isinstance(br, dict) and isinstance(br.get("context"), str) and len(br["context"]) > 120:
-                    br["context"] = br["context"][:120]
-        if size(r) <= budget_bytes:
-            return r
-
-    r["status"] = (r.get("status", "") + " ; partial: payload budget trim").strip(" ;")
-    for key in arrays:
-        if key in r and isinstance(r[key], list):
-            r[key] = r[key][:25]
-    return r
-
-def _json_ok(result: Dict[str, Any], budget_bytes: int = 3_000_000) -> JSONResponse:
-    """Return a JSON 200 with charset, enforcing a byte budget."""
-    safe = _shrink_report_for_budget(result, budget_bytes)
-    # Log final payload size for Agent debugging
-    log.info(f"[report] payload_bytes={len(json.dumps(safe, ensure_ascii=False).encode('utf-8'))} status={safe.get('status')}")
-    return JSONResponse(
-        content=safe,
-        status_code=200,
-        media_type="application/json; charset=utf-8",
-    )
-
-# ------------------------------------------------------------
-# /report with deadline, summary mode, caching, breadth caps, fallbacks
-# ------------------------------------------------------------
-class _ReqScopeCache:
-    def __init__(self):
-        self.file_json: Dict[tuple, Dict[str, Any]] = {}   # (path, ref) → file_get() result
-        self.deps_json: Dict[tuple, Dict[str, Any]] = {}   # (file, ref) → deps_get() result
-
-async def _analyze_single_file(path: str, ref: Optional[str], file_get_fn, deps_get_fn, deadline_ms: int) -> Dict[str, Any]:
-    if _deadline_expired(deadline_ms):
-        return {"path": path, "ref": ref, "error": "deadline_exceeded"}
-
-    corrected_from = None
-    # Resolve correct path with fallbacks before fetching
+    # Try to fetch file first (for sha/content_len)
     try:
-        resolved_path, corrected_from = await _resolve_existing_path_with_fallbacks(path, ref)
-    except HTTPException as e:
-        if e.status_code == 404:
-            return {"path": path, "ref": ref, "error": "file_get: 404 not found (no folder fallback)"}
-        return {"path": path, "ref": ref, "error": f"file_get: {e.status_code}"}
-
-    try:
-        file_res = await file_get_fn(path=resolved_path, ref=ref)
+        file_res = await file_get(path=path, ref=ref)  # type: ignore
     except Exception as e:
-        return {"path": resolved_path, "ref": ref, "error": f"file_get: {e}"}
+        file_res = {"sha": None, "content": "", "ref": used_ref}
+        file_err = f"file_get: {e}"
+    else:
+        file_err = None
 
-    try:
-        deps_res = await deps_get_fn(file=resolved_path, ref=ref)
-    except Exception as e:
-        return {
-            "path": resolved_path, "ref": ref,
-            "sha": file_res.get("sha"),
-            "content_len": len(file_res.get("content", "")),
-            "dependencies": [], "business_rules": [], "implicit_crud": [],
-            "error": f"deps_get: {e}"
-        }
+    # Now run deps with retries/normalization
+    node = await _safe_deps_normalized(path, used_ref)
 
-    # Normalize + filter deps
+    # Normalize and filter dependencies (defense in depth)
     norm_deps: List[Dict[str, Any]] = []
-    for d in deps_res.get("dependencies", []) or []:
-        clean = _normalize_dep_path(d.get("path") or "")
+    for d in node.get("deps", []) or []:
+        raw = d.get("path") or ""
+        clean = _normalize_dep_path(raw)
         if _should_skip_dep_path(clean):
             continue
         nd = dict(d)
         nd["path"] = clean
         norm_deps.append(nd)
 
-    # Trim near-deadline
-    if _time_left(deadline_ms) < 5000 and len(norm_deps) > 200:
-        norm_deps = norm_deps[:200]
-
-    out = {
-        "path": resolved_path,
-        "ref": deps_res.get("ref", ref),
-        "sha": deps_res.get("sha") or file_res.get("sha", "unknown"),
+    return {
+        "path": path,
+        "ref": node.get("ref", used_ref),
+        "sha": file_res.get("sha"),
         "content_len": len(file_res.get("content", "")),
         "dependencies": norm_deps,
-        "business_rules": deps_res.get("business_rules", []),
-        "implicit_crud": deps_res.get("implicit_crud", []),
-        "error": None,
+        "business_rules": node.get("business", []),
+        "implicit_crud": node.get("implicit", []),
+        "invocation_paths": node.get("invocations", []),
+        "error": file_err or node.get("error"),
     }
-    if corrected_from:
-        out["corrected_from"] = corrected_from
-    return out
 
+# ------------------------------------------------------------
+# ENDPOINT: /report (resolve + analyze every visited file)
+# ------------------------------------------------------------
 @app.post("/report")
 @app.post("/report/")
 async def report_post(payload: Dict[str, Any] = Body(...)):
     """
-    Full transitive analysis in one call with a hard deadline, summary mode,
-    breadth caps, and folder-fallback retries for misclassified dependencies.
+    Full transitive analysis in one call:
+      1) resolve -> full visited set (depth <= max_depth)  [with reclass + filtering]
+      2) analyze each visited file -> (/file + /deps)      [with reclass + filtering]
+      3) merge into a single report payload
+
     Body:
-      {
-        "start_file": "Forms/mssBDAckTableFurn.xpo",
-        "ref": "main",
-        "max_depth": 5,
-        "max_concurrency": 8,
-        "timeout_ms": 110000,
-        "mode": "full" | "summary",
-        "level_cap": 400,
-        "top_n": 200
-      }
+    {
+      "start_file": "Forms/mssBDAckTableFurn.xpo",
+      "ref": "main",
+      "max_depth": 5,
+      "max_concurrency": 8   # optional
+    }
     """
     env = get_env()
     start_file: str = payload.get("start_file")
     if not start_file:
         raise HTTPException(400, "Missing required field: start_file")
-
     used_ref = payload.get("ref") or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
-
-    # Limits / defaults
     max_depth = int(payload.get("max_depth", 5))
-    max_depth = max(1, min(max_depth, 10))
-
     max_conc = int(payload.get("max_concurrency", int(os.getenv("MAX_CONCURRENCY", "8"))))
-    max_conc = max(1, min(max_conc, 16))
 
-    timeout_ms = int(payload.get("timeout_ms", int(os.getenv("REPORT_TIMEOUT_MS", "110000"))))
-    deadline = _now_ms() + timeout_ms
-
-    mode = (payload.get("mode") or "full").lower()
-    level_cap = int(payload.get("level_cap", int(os.getenv("LEVEL_CAP", "400"))))
-    top_n = int(payload.get("top_n", int(os.getenv("SUMMARY_TOP_N", "200"))))
-
-    # Hard caps for runaway graphs
-    MAX_VISITED = int(os.getenv("MAX_VISITED", "1500"))
-    MAX_EDGES   = int(os.getenv("MAX_EDGES",   "12000"))
-    MAX_RULES   = int(os.getenv("MAX_RULES",   "5000"))
-
-    # Per-request caches
-    scope = _ReqScopeCache()
-
-    async def file_get_cached(path: str, ref: Optional[str]):
-        key = (path, ref or used_ref)
-        if key in scope.file_json:
-            return scope.file_json[key]
-        res = await file_get(path=path, ref=ref)  # type: ignore
-        scope.file_json[key] = res
-        return res
-
-    async def deps_get_cached(file: str, ref: Optional[str]):
-        key = (file, ref or used_ref)
-        if key in scope.deps_json:
-            return scope.deps_json[key]
-        res = await deps_get(file=file, ref=ref, page=1, limit=200)  # type: ignore
-        scope.deps_json[key] = res
-        return res
-
-    # --------- 1) internal resolve (bounded, deadline-aware) with fallbacks ----------
+    # --------- 1) internal resolve with reclassification ----------
     visited: Set[str] = set()
     graph: List[Dict[str, Any]] = []
     implicit_all: List[Dict[str, Any]] = []
     current_level: List[str] = [start_file]
     depth = 0
-    overflow = False
 
-    # Map of corrections found during resolve: original -> corrected
-    corrections: Dict[str, str] = {}
-
-    async def deps_get_with_fallback(file: str, ref: Optional[str]) -> Tuple[str, Dict[str, Any]]:
-        try:
-            node = await deps_get_cached(file=file, ref=ref)
-            return file, node
-        except HTTPException as e:
-            if e.status_code != 404:
-                raise
-            # Try alternatives
-            folder, symbol = _split_folder_symbol(file)
-            if not folder or not symbol:
-                raise
-            for alt in _alt_folders_for(folder):
-                candidate = f"{alt}/{symbol}.xpo"
-                try:
-                    node = await deps_get_cached(file=candidate, ref=ref)
-                    log.info(f"[report.resolve.fallback] {file} -> {candidate}")
-                    corrections[file] = candidate
-                    return candidate, node
-                except HTTPException as ee:
-                    if ee.status_code == 404:
-                        continue
-                    else:
-                        raise
-            # Re-raise original 404
-            raise
-
-    while current_level and depth < max_depth and not _deadline_expired(deadline):
-        if len(current_level) > level_cap:
-            current_level = current_level[:level_cap]
-            overflow = True
-
+    while current_level and depth < max_depth:
         level_files = [f for f in current_level if f not in visited]
         visited.update(level_files)
 
-        results = await asyncio.gather(*[deps_get_with_fallback(f, used_ref) for f in level_files], return_exceptions=True)
-        next_level: List[str] = []
+        results = await asyncio.gather(*[_safe_deps_normalized(f, used_ref) for f in level_files])
 
+        next_level: List[str] = []
         for res in results:
-            if isinstance(res, Exception):
-                graph.append({"file": "unknown", "depth": depth, "dependencies": [], "error": str(res)})
+            file = res["file"]
+            err = res.get("error")
+            deps = res.get("deps") or []
+            implicit_all.extend(res.get("implicit", []))
+            if err:
+                graph.append({"file": file, "depth": depth, "dependencies": [], "error": err})
                 continue
 
-            real_file, node = res
-            implicit_all.extend(node.get("implicit_crud", []))
-
-            dep_paths: List[str] = []
-            for d in node.get("dependencies", []):
-                clean = _normalize_dep_path(d.get("path") or "")
-                if _should_skip_dep_path(clean):
-                    continue
-                dep_paths.append(clean)
-
-            graph.append({"file": real_file, "depth": depth, "dependencies": dep_paths, "error": None})
+            dep_paths: List[str] = [d["path"] for d in deps]
+            graph.append({"file": file, "depth": depth, "dependencies": dep_paths, "error": None})
             next_level.extend(dep_paths)
 
         depth += 1
-        if len(visited) >= MAX_VISITED:
-            overflow = True
-            break
-
-        current_level = [f for f in dict.fromkeys(next_level) if f not in visited]
-
-    # Apply path corrections to visited set
-    if corrections:
-        new_visited: Set[str] = set()
-        for v in visited:
-            new_visited.add(corrections.get(v, v))
-        visited = new_visited
-        # Also rewrite graph file names to corrected ones
-        for g in graph:
-            g["file"] = corrections.get(g["file"], g["file"])
+        current_level = [f for f in set(next_level) if f not in visited]
 
     visited_list = sorted(list(visited))
 
-    # --------- 2) analyze (bounded concurrency, deadline-aware) w/ fallbacks ----------
+    # --------- 2) analyze each visited file with bounded concurrency ----------
     sem = Semaphore(max_conc)
     async def _guarded_analyze(p: str):
-        if _deadline_expired(deadline):
-            return {"path": p, "ref": used_ref, "error": "deadline_exceeded"}
         async with sem:
-            return await _analyze_single_file(p, used_ref, file_get_cached, deps_get_cached, deadline)
+            return await _analyze_single_file(p, used_ref, used_ref)
 
-    if mode == "summary" and len(visited_list) > top_n:
-        sample = visited_list[:top_n]
-        analyses = await asyncio.gather(*[_guarded_analyze(p) for p in sample])
-        overflow = True
-    else:
-        analyses = await asyncio.gather(*[_guarded_analyze(p) for p in visited_list])
+    analyses = await asyncio.gather(*[_guarded_analyze(p) for p in visited_list])
 
     # --------- 3) merge into objects/edges/rules ----------
     objects: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     business_rules_all: List[Dict[str, Any]] = []
     implicit_crud_all: List[Dict[str, Any]] = list(implicit_all)
+    invocation_all: List[Dict[str, Any]] = []
 
-    # Build depth index after any corrections
     depth_index = {g["file"]: g["depth"] for g in graph}
-
-    # Map any analysis corrections back into the graph index if needed
-    for a in analyses:
-        # If analyzer returned corrected_from, ensure both map to same depth
-        corrected_from = a.get("corrected_from")
-        if corrected_from and a.get("path"):
-            if corrected_from in depth_index and a["path"] not in depth_index:
-                depth_index[a["path"]] = depth_index[corrected_from]
-
     for a in analyses:
         objects.append({
             "path": a.get("path"),
@@ -950,8 +748,9 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
             })
         business_rules_all.extend(a.get("business_rules", []) or [])
         implicit_crud_all.extend(a.get("implicit_crud", []) or [])
+        invocation_all.extend(a.get("invocation_paths", []) or [])
 
-    # De-dupe edges
+    # dedupe edges
     seen = set()
     dedup_edges = []
     for e in edges:
@@ -961,38 +760,17 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
         seen.add(key)
         dedup_edges.append(e)
 
-    # Hard trims for oversized
-    MAX_EDGES_ENV = int(os.getenv("MAX_EDGES", "12000"))
-    MAX_RULES_ENV = int(os.getenv("MAX_RULES", "5000"))
-    trimmed = False
-    if len(dedup_edges) > MAX_EDGES_ENV:
-        dedup_edges = dedup_edges[:MAX_EDGES_ENV]
-        trimmed = True
-    if len(business_rules_all) > MAX_RULES_ENV:
-        business_rules_all = business_rules_all[:MAX_RULES_ENV]
-        trimmed = True
-
-    status_parts = []
-    if overflow:
-        status_parts.append("partial: breadth capped")
-    if trimmed:
-        status_parts.append("partial: payload trimmed")
-    if _deadline_expired(deadline):
-        status_parts.append("partial: deadline exceeded")
-    if not status_parts:
-        status_parts.append("complete")
-
-    result = {
+    return {
         "root": start_file,
         "ref": used_ref,
         "max_depth": max_depth,
         "depth_completed": depth,
-        "visited": visited_list if mode == "full" else visited_list[:top_n],
-        "graph": graph if mode == "full" else graph[:top_n],
-        "objects": objects if mode == "full" else objects[:top_n],
-        "edges": dedup_edges if mode == "full" else dedup_edges[:top_n],
-        "business_rules": business_rules_all if mode == "full" else business_rules_all[:top_n],
-        "implicit_crud": implicit_crud_all if mode == "full" else implicit_crud_all[:top_n],
-        "status": " ; ".join(status_parts)
+        "visited": visited_list,
+        "graph": graph,
+        "objects": objects,
+        "edges": dedup_edges,
+        "business_rules": business_rules_all,
+        "implicit_crud": implicit_crud_all,
+        "invocation_paths": invocation_all,
+        "status": "complete"
     }
-    return _json_ok(result, budget_bytes=int(os.getenv("REPORT_BUDGET_BYTES", "3000000")))
