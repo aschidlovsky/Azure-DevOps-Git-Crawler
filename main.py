@@ -140,8 +140,8 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 # LIGHTWEIGHT PARSER (with kernel/system filtering + Form DS implicit CRUD)
 # ------------------------------------------------------------
 DEPENDENCY_PATTERNS = [
-    # Keep broad pattern for back-compat; validation gate will filter junk
-    (r"\b(select|insert|update|delete)\s+(\w+)", "Table", "statement"),
+    # Tables referenced in queries (avoids EDT/field names)
+    (r"\b(from|join)\s+([A-Z][A-Za-z0-9_]{2,}|mss[A-Za-z0-9_]{2,})\b", "Table", "from-join"),
     (r"\b(\w+)\.DataSource\(", "Table", "DataSource()"),
     (r"\b(\w+)::(construct|new|run)\b", "Class", "static-call"),
     (r"\bnew\s+(\w+)\s*\(", "Class", "new"),
@@ -185,7 +185,7 @@ TYPE_PATHS = {
 def _looks_like_form_path(file_path: str) -> bool:
     return file_path.startswith("Forms/") or (file_path.lower().endswith(".xpo") and "/forms/" in file_path.lower())
 
-# ---------- NEW: Symbol validation (filters false positives) ----------
+# ---------- Symbol validation (filters false positives) ----------
 # Accept only identifiers that look like AX objects:
 #   - Start with uppercase (e.g., PurchLine, SalesTable, InventTrans)
 #   - Or start with "mss" (your prefix), case-insensitive
@@ -215,10 +215,10 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     # Direct dependency detection (with folder mapping)
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
         for m in re.finditer(pattern, content, re.IGNORECASE):
-            symbol = m.group(2) if reason == "statement" else m.group(1)
+            symbol = m.group(2) if reason in ("from-join", "statement") else m.group(1)
             if not symbol:
                 continue
-            # NEW: reject non-AX-ish or obvious junk identifiers
+            # reject non-AX-ish or obvious junk identifiers
             if not is_valid_symbol(symbol):
                 continue
             if symbol in KERNEL_SKIP:
@@ -301,7 +301,7 @@ def _should_skip_dep_path(p: str) -> bool:
     folder, symbol = m.group(1), m.group(2)
     if folder not in ALLOWED_FOLDERS:
         return True
-    # NEW: enforce valid AX-like symbol form
+    # enforce valid AX-like symbol form
     if not is_valid_symbol(symbol):
         return True
     if symbol in KERNEL_SKIP:
