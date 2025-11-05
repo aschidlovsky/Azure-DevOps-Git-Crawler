@@ -1025,7 +1025,3 @@ sized["truncated"] = truncated
 sized["approx_bytes"] = _approx_size(**sized)
 return sized
 ```
-
-# FYI: Ensure your start command points to main:app
-
-# uvicorn main:app --host 0.0.0.0 --port $PORT
