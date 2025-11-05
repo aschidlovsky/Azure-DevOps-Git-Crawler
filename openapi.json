@@ -2,13 +2,13 @@
   "openapi": "3.0.3",
   "info": {
     "title": "ADO Repo Dependency Connector",
-    "version": "1.3.2",
-    "description": "Custom API for browsing Azure DevOps XPO repositories and extracting dependency graphs."
+    "version": "1.4.0",
+    "description": "API for exploring Dynamics AX / D365 X++ dependencies in Azure DevOps Git repositories."
   },
   "servers": [
     {
       "url": "https://your-host-name.example.com",
-      "description": "Deployed service URL"
+      "description": "Deployed service"
     },
     {
       "url": "http://localhost:8080",
@@ -98,7 +98,6 @@
           {
             "name": "ref",
             "in": "query",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -140,230 +139,106 @@
         }
       }
     },
-    "/resolve": {
+    "/report.firsthop": {
       "post": {
-        "summary": "Breadth-First Dependency Crawl",
-        "operationId": "postResolve",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ResolveRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Traversal completed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ResolveResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Missing start_file or invalid parameters"
-          }
-        }
-      }
-    },
-    "/report": {
-      "post": {
-        "summary": "Full Dependency Report",
-        "operationId": "postReport",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReportRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Report generated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReportResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Missing start_file or invalid parameters"
-          }
-        }
-      }
-    },
-    "/report.paged": {
-      "get": {
-        "summary": "Paged Dependency Report (GET)",
-        "operationId": "getReportPaged",
-        "parameters": [
-          {
-            "name": "start_file",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "description": "Starting file for traversal. Required when no cursor is supplied."
-          },
-          {
-            "name": "ref",
-            "in": "query",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "cursor",
-            "in": "query",
-            "schema": {
-              "type": "string"
-            },
-            "description": "Opaque cursor returned by the previous page."
-          },
-          {
-            "name": "max_depth",
-            "in": "query",
-            "schema": {
-              "type": "integer",
-              "default": 5
-            }
-          },
-          {
-            "name": "page_limit_nodes",
-            "in": "query",
-            "schema": {
-              "type": "integer",
-              "default": 200
-            }
-          },
-          {
-            "name": "max_concurrency",
-            "in": "query",
-            "schema": {
-              "type": "integer",
-              "default": 8
-            }
-          },
-          {
-            "name": "max_bytes",
-            "in": "query",
-            "schema": {
-              "type": "integer",
-              "default": 1200000
-            }
-          },
-          {
-            "name": "max_wall_time",
-            "in": "query",
-            "schema": {
-              "type": "number",
-              "format": "float",
-              "default": 25.0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Page returned",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PagedReportResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Missing start_file and no cursor provided"
-          }
-        }
-      },
-      "post": {
-        "summary": "Paged Dependency Report (POST)",
-        "operationId": "postReportPaged",
+        "summary": "Analyze an entry file (depth 1)",
+        "operationId": "postReportFirstHop",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "type": "object",
+                "required": ["start_file"],
                 "properties": {
                   "start_file": {
                     "type": "string",
-                    "description": "Required when no cursor is provided. Example: Forms/CustTable.xpo"
+                    "description": "Entry file to analyze"
                   },
                   "ref": {
                     "type": "string",
                     "description": "Branch or tag; defaults to DEFAULT_REF"
-                  },
-                  "cursor": {
-                    "type": "string",
-                    "description": "Opaque cursor string returned by a previous call"
-                  },
-                  "max_depth": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 5
-                  },
-                  "page_limit_nodes": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 200
-                  },
-                  "max_concurrency": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 8
-                  },
-                  "max_bytes": {
-                    "type": "integer",
-                    "minimum": 1000,
-                    "default": 1200000
-                  },
-                  "max_wall_time": {
-                    "type": "number",
-                    "format": "float",
-                    "minimum": 1,
-                    "default": 25.0
                   }
-                },
-                "required": ["start_file"],
-                "oneOf": [
-                  {
-                    "required": ["cursor"]
-                  },
-                  {
-                    "required": ["start_file"]
-                  }
-                ]
+                }
               }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "Page returned",
+            "description": "Direct dependencies returned",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PagedReportResponse"
+                  "$ref": "#/components/schemas/FirstHopResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/report.branch": {
+      "post": {
+        "summary": "Traverse a single dependency branch",
+        "operationId": "postReportBranch",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["start_file"],
+                "properties": {
+                  "start_file": {
+                    "type": "string",
+                    "description": "Root of the branch to explore"
+                  },
+                  "ref": {
+                    "type": "string",
+                    "description": "Branch or tag; defaults to DEFAULT_REF"
+                  },
+                  "max_depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 5,
+                    "description": "Maximum depth to traverse"
+                  },
+                  "max_files": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 80,
+                    "description": "Maximum number of files to analyze"
+                  },
+                  "max_concurrency": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 6
+                  },
+                  "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "default": 350000,
+                    "description": "Approximate response size budget"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Branch traversal completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchResponse"
                 }
               }
             }
           },
           "400": {
-            "description": "Missing start_file and no cursor provided"
+            "description": "Missing required fields"
           }
         }
       }
@@ -396,13 +271,7 @@
           },
           "type": {
             "type": "string",
-            "enum": [
-              "Table",
-              "Class",
-              "Form",
-              "Map",
-              "Unknown"
-            ]
+            "enum": ["Table", "Class", "Form", "Map", "Unknown"]
           },
           "symbol": {
             "type": "string"
@@ -505,26 +374,7 @@
           }
         }
       },
-      "ResolveRequest": {
-        "type": "object",
-        "required": [
-          "start_file"
-        ],
-        "properties": {
-          "start_file": {
-            "type": "string",
-            "description": "Starting .xpo path for traversal"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "max_depth": {
-            "type": "integer",
-            "default": 5
-          }
-        }
-      },
-      "ResolveResponse": {
+      "FirstHopResponse": {
         "type": "object",
         "properties": {
           "root": {
@@ -533,98 +383,36 @@
           "ref": {
             "type": "string"
           },
-          "max_depth": {
+          "sha": {
+            "type": "string"
+          },
+          "content_len": {
             "type": "integer"
           },
-          "depth_completed": {
-            "type": "integer"
+          "status": {
+            "type": "string",
+            "example": "ok"
           },
-          "total_files": {
-            "type": "integer"
+          "error": {
+            "type": "string",
+            "nullable": true
           },
-          "visited": {
+          "direct_dependencies": {
             "type": "array",
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/Dependency"
+            }
+          },
+          "dependency_counts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer"
             }
           },
           "implicit_crud": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ImplicitCrud"
-            }
-          },
-          "graph": {
-            "type": "array",
-            "items": {
-              "type": "object"
-            }
-          },
-          "status": {
-            "type": "string",
-            "example": "complete"
-          }
-        }
-      },
-      "ReportRequest": {
-        "type": "object",
-        "required": [
-          "start_file"
-        ],
-        "properties": {
-          "start_file": {
-            "type": "string"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "max_depth": {
-            "type": "integer",
-            "default": 5
-          },
-          "max_concurrency": {
-            "type": "integer",
-            "default": 8
-          }
-        }
-      },
-      "ReportResponse": {
-        "type": "object",
-        "properties": {
-          "root": {
-            "type": "string"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "max_depth": {
-            "type": "integer"
-          },
-          "depth_completed": {
-            "type": "integer"
-          },
-          "visited": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "graph": {
-            "type": "array",
-            "items": {
-              "type": "object"
-            }
-          },
-          "objects": {
-            "type": "array",
-            "items": {
-              "type": "object"
-            }
-          },
-          "edges": {
-            "type": "array",
-            "items": {
-              "type": "object"
             }
           },
           "business_rules": {
@@ -633,78 +421,157 @@
               "$ref": "#/components/schemas/BusinessRule"
             }
           },
-          "implicit_crud": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ImplicitCrud"
-            }
-          },
-          "status": {
-            "type": "string",
-            "example": "complete"
-          }
-        }
-      },
-      "PagedReportResponse": {
-        "type": "object",
-        "properties": {
-          "root": {
-            "type": "string"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "depth_completed": {
+          "total_dependencies": {
             "type": "integer"
-          },
-          "objects": {
-            "type": "array",
-            "items": {
-              "type": "object"
-            }
-          },
-          "edges": {
-            "type": "array",
-            "items": {
-              "type": "object"
-            }
-          },
-          "business_rules": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/BusinessRule"
-            }
-          },
-          "implicit_crud": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ImplicitCrud"
-            }
-          },
-          "graph": {
-            "type": "array",
-            "items": {
-              "type": "object"
-            }
-          },
-          "visited_delta": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
           },
           "approx_bytes": {
+            "type": "integer"
+          }
+        }
+      },
+      "GraphNode": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "depth": {
+            "type": "integer"
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "BranchObject": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "sha": {
+            "type": "string"
+          },
+          "depth": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "Edge": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "depth_from_root": {
+            "type": "integer"
+          }
+        }
+      },
+      "BranchResponse": {
+        "type": "object",
+        "properties": {
+          "root": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "max_depth": {
+            "type": "integer"
+          },
+          "depth_completed": {
+            "type": "integer"
+          },
+          "visited": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "visited_count": {
+            "type": "integer"
+          },
+          "limit_reached": {
+            "type": "boolean"
+          },
+          "pending": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "graph": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphNode"
+            }
+          },
+          "objects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BranchObject"
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Edge"
+            }
+          },
+          "business_rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BusinessRule"
+            }
+          },
+          "implicit_crud": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImplicitCrud"
+            }
+          },
+          "status": {
+            "type": "string",
+            "example": "complete"
+          },
+          "max_files": {
+            "type": "integer"
+          },
+          "max_concurrency": {
+            "type": "integer"
+          },
+          "max_bytes": {
             "type": "integer"
           },
           "truncated": {
             "type": "boolean"
           },
-          "stats": {
-            "type": "object"
-          },
-          "next_cursor": {
-            "type": "string",
-            "nullable": true
+          "approx_bytes": {
+            "type": "integer"
           }
         }
       }

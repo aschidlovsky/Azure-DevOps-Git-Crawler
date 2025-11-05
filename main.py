@@ -7,7 +7,6 @@ import os
 import re
 import time
 from asyncio import Semaphore
-from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
@@ -43,8 +42,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "detail": "Invalid or missing request payload.",
             "hints": [
                 "Send JSON with Content-Type: application/json.",
-                "For /report.paged: either provide start_file (+ optional ref, max_depth, etc.) or provide cursor.",
-                "GET query params are also supported for /report.paged.",
+                "Use /report.firsthop with a start_file to fetch immediate dependencies.",
+                "Use /report.branch for deeper exploration of a specific dependency.",
             ],
             "pydantic": exc.errors(),
         },
@@ -184,23 +183,51 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-
 DEFAULT_MAX_DEPTH = _env_int("MAX_DEPTH_DEFAULT", 5)
-DEFAULT_PAGE_LIMIT_NODES = _env_int("PAGE_LIMIT_NODES_DEFAULT", 75)
 DEFAULT_MAX_CONCURRENCY = _env_int("MAX_CONCURRENCY_DEFAULT", 6)
 DEFAULT_MAX_BYTES = _env_int("MAX_BYTES_DEFAULT", 350_000)
-DEFAULT_MAX_WALL_TIME = _env_float("MAX_WALL_TIME_DEFAULT", 25.0)
+DEFAULT_MAX_FILES = _env_int("MAX_FILES_DEFAULT", 80)
 
 _CACHE_TTL_SECONDS = _env_int("ITEM_CACHE_TTL", 600)
 _ITEM_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _NEGATIVE_CACHE: Dict[str, float] = {}
 _CACHE_LOCK = asyncio.Lock()
+
+# =========================================
+# SIZE UTILITIES
+# =========================================
+
+def _approx_size(obj: Dict[str, Any]) -> int:
+    try:
+        return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _apply_size_budget(max_bytes: int, resp: Dict[str, Any], fields_order: List[str]) -> Tuple[Dict[str, Any], bool]:
+    """
+    Trim list fields repeatedly until the response fits under the byte budget.
+    """
+    truncated = False
+    current = _approx_size(resp)
+    if current <= max_bytes:
+        return resp, truncated
+
+    while current > max_bytes:
+        trimmed = False
+        for field in fields_order:
+            value = resp.get(field)
+            if isinstance(value, list) and value:
+                drop = max(1, math.ceil(len(value) * 0.15))
+                resp[field] = value[:-drop]
+                truncated = True
+                trimmed = True
+                break
+        if not trimmed:
+            break
+        current = _approx_size(resp)
+    return resp, truncated
+
 
 # =========================================
 # HELPERS
@@ -580,85 +607,6 @@ async def deps_get(
     }
 
 
-# =========================================
-# /resolve (BFS graph only)
-# =========================================
-
-async def _deps_paths_only(file: str, ref: str) -> Tuple[List[str], List[Dict[str, Any]]]:
-    node = await deps_get(file=file, ref=ref, page=1, limit=200)  # type: ignore[call-arg]
-    dep_paths: List[str] = []
-    for dep in node.get("dependencies", []):
-        raw = dep.get("path") or ""
-        clean = _normalize_dep_path(raw)
-        if _should_skip_dep_path(clean):
-            continue
-        dep_paths.append(clean)
-    # carry implicit for aggregation
-    return dep_paths, node.get("implicit_crud", [])
-
-
-@app.post("/resolve")
-@app.post("/resolve/")
-async def resolve_post(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    env = get_env()
-    start_file: str = payload.get("start_file")
-    if not start_file:
-        raise HTTPException(400, "Missing required field: start_file")
-
-    used_ref: str = payload.get("ref") or env["REF"]
-    if str(used_ref).upper() == "HEAD":
-        used_ref = env["REF"]
-    max_depth = int(payload.get("max_depth", 5))
-
-    visited: Set[str] = set()
-    graph: List[Dict[str, Any]] = []
-    implicit_all: List[Dict[str, Any]] = []
-    current_level: List[str] = [start_file]
-    depth = 0
-
-    async def safe(file_path: str) -> Dict[str, Any]:
-        try:
-            deps, implicit = await _deps_paths_only(file_path, used_ref)
-            implicit_all.extend(implicit)
-            return {"file": file_path, "deps": deps, "error": None}
-        except Exception as exc:  # noqa: BLE001
-            log.error("[resolve] Failed deps_get for %s: %s", file_path, exc)
-            return {"file": file_path, "deps": None, "error": str(exc)}
-
-    while current_level and depth < max_depth:
-        level_files = [f for f in current_level if f not in visited]
-        visited.update(level_files)
-        results = await asyncio.gather(*[safe(f) for f in level_files])
-        next_level: List[str] = []
-        for res in results:
-            if res["error"]:
-                graph.append(
-                    {"file": res["file"], "error": res["error"], "depth": depth, "dependencies": []}
-                )
-                continue
-            deps = res["deps"] or []
-            graph.append({"file": res["file"], "depth": depth, "dependencies": deps, "error": None})
-            next_level.extend(deps)
-        depth += 1
-        current_level = [f for f in set(next_level) if f not in visited]
-
-    return {
-        "root": start_file,
-        "ref": used_ref,
-        "max_depth": max_depth,
-        "depth_completed": depth,
-        "total_files": len(visited),
-        "visited": sorted(list(visited)),
-        "implicit_crud": implicit_all,
-        "graph": graph,
-        "status": "complete",
-    }
-
-
-# =========================================
-# /report (full transitive, single-call)
-# =========================================
-
 async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
     # fetch file
     try:
@@ -704,613 +652,253 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
     }
 
 
-@app.post("/report")
-@app.post("/report/")
-async def report_post(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    env = get_env()
-    start_file: str = payload.get("start_file")
-    if not start_file:
-        raise HTTPException(400, "Missing required field: start_file")
-    used_ref: str = payload.get("ref") or env["REF"]
-    if str(used_ref).upper() == "HEAD":
-        used_ref = env["REF"]
-    max_depth = int(payload.get("max_depth", 5))
-    max_conc = int(payload.get("max_concurrency", int(os.getenv("MAX_CONCURRENCY", "8"))))
+# =========================================
+# BRANCH COLLECTOR
+# =========================================
 
-    # internal resolve
-    visited: Set[str] = set()
-    graph: List[Dict[str, Any]] = []
-    implicit_all: List[Dict[str, Any]] = []
-    current_level: List[str] = [start_file]
+async def _collect_branch(
+    start_file: str,
+    used_ref: str,
+    max_depth: int,
+    max_files: int,
+    max_concurrency: int,
+) -> Dict[str, Any]:
+    sem = Semaphore(max_concurrency)
+    analysis_cache: Dict[str, Dict[str, Any]] = {}
+    depths: Dict[str, int] = {}
+    visit_order: List[str] = []
+    overflow: List[str] = []
+
+    async def _analyze_guarded(path: str) -> Dict[str, Any]:
+        if path in analysis_cache:
+            return analysis_cache[path]
+        async with sem:
+            analysis = await _analyze_single_file(path, used_ref)
+        analysis_cache[path] = analysis
+        return analysis
+
+    frontier: List[str] = [start_file]
     depth = 0
 
-    async def safe(file_path: str) -> Dict[str, Any]:
-        try:
-            node = await deps_get(file=file_path, ref=used_ref, page=1, limit=200)  # type: ignore[call-arg]
-            implicit_all.extend(node.get("implicit_crud", []))
-            dep_paths: List[str] = []
-            for dep in node.get("dependencies", []):
-                clean = _normalize_dep_path(dep.get("path") or "")
-                if _should_skip_dep_path(clean):
-                    continue
-                dep_paths.append(clean)
-            return {"file": file_path, "deps": dep_paths, "error": None}
-        except Exception as exc:  # noqa: BLE001
-            log.error("[report] Failed deps_get for %s: %s", file_path, exc)
-            return {"file": file_path, "deps": None, "error": str(exc)}
-
-    while current_level and depth < max_depth:
-        level_files = [f for f in current_level if f not in visited]
-        visited.update(level_files)
-        results = await asyncio.gather(*[safe(f) for f in level_files])
-
-        next_level: List[str] = []
-        for res in results:
-            if res["error"]:
-                graph.append(
-                    {"file": res["file"], "depth": depth, "dependencies": [], "error": res["error"]}
-                )
+    while frontier and depth <= max_depth and len(visit_order) < max_files:
+        level: List[str] = []
+        for path in frontier:
+            if path in depths:
                 continue
-            deps = res["deps"] or []
-            graph.append({"file": res["file"], "depth": depth, "dependencies": deps, "error": None})
-            next_level.extend(deps)
+            if len(visit_order) >= max_files:
+                break
+            depths[path] = depth
+            visit_order.append(path)
+            level.append(path)
 
+        if not level:
+            break
+
+        analyses = await asyncio.gather(*[_analyze_guarded(path) for path in level])
+
+        next_frontier: List[str] = []
+        for path, analysis in zip(level, analyses):
+            if analysis.get("error"):
+                continue
+            if depth >= max_depth:
+                continue
+            for dep in analysis.get("dependencies", []) or []:
+                dep_path = dep.get("path")
+                if not dep_path or dep_path in depths:
+                    continue
+                if dep_path in next_frontier:
+                    continue
+                if len(visit_order) + len(next_frontier) < max_files:
+                    next_frontier.append(dep_path)
+                else:
+                    overflow.append(dep_path)
+
+        frontier = next_frontier
         depth += 1
-        current_level = [f for f in set(next_level) if f not in visited]
 
-    visited_list = sorted(list(visited))
+    depth_completed = max(depths.values()) if depths else 0
+    limit_reached = len(visit_order) >= max_files
+    more_available = bool(frontier) or bool(overflow)
 
-    # analyze each visited with bounded concurrency
-    sem = Semaphore(max_conc)
-
-    async def _guarded(path: str) -> Dict[str, Any]:
-        async with sem:
-            return await _analyze_single_file(path, used_ref)
-
-    analyses = await asyncio.gather(*[_guarded(path) for path in visited_list])
-
-    # merge
-    objects: List[Dict[str, Any]] = []
+    graph: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
-    business_rules_all: List[Dict[str, Any]] = []
-    implicit_crud_all: List[Dict[str, Any]] = list(implicit_all)
+    business_rules: List[Dict[str, Any]] = []
+    implicit_crud: List[Dict[str, Any]] = []
+    objects: List[Dict[str, Any]] = []
+    seen_edges: Set[Tuple[str, str, Optional[str]]] = set()
 
-    depth_index = {node["file"]: node["depth"] for node in graph}
-    for analysis in analyses:
+    for path in visit_order:
+        analysis = await _analyze_guarded(path)
+        depth_idx = depths.get(path, -1)
         objects.append(
             {
-                "path": analysis.get("path"),
+                "path": analysis.get("path", path),
                 "ref": analysis.get("ref", used_ref),
                 "sha": analysis.get("sha", "unknown"),
-                "depth": depth_index.get(analysis.get("path"), -1),
+                "depth": depth_idx,
                 "error": analysis.get("error"),
             }
         )
+
+        business_rules.extend(analysis.get("business_rules", []) or [])
+        implicit_crud.extend(analysis.get("implicit_crud", []) or [])
+
+        if analysis.get("error"):
+            graph.append({"file": path, "depth": depth_idx, "dependencies": [], "error": analysis["error"]})
+            continue
+
+        deps = []
         for dep in analysis.get("dependencies", []) or []:
+            dep_path = dep.get("path")
+            if not dep_path:
+                continue
+            deps.append(dep_path)
+            edge_key = (path, dep_path, dep.get("reason"))
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
             edges.append(
                 {
-                    "from": analysis.get("path"),
-                    "to": dep.get("path"),
+                    "from": path,
+                    "to": dep_path,
                     "reason": dep.get("reason"),
                     "type": dep.get("type"),
-                    "depth_from_root": depth_index.get(analysis.get("path"), -1) + 1,
+                    "depth_from_root": depth_idx + 1,
                 }
             )
-        business_rules_all.extend(analysis.get("business_rules", []) or [])
-        implicit_crud_all.extend(analysis.get("implicit_crud", []) or [])
 
-    # dedupe edges
-    seen_edges = set()
-    dedup_edges: List[Dict[str, Any]] = []
-    for edge in edges:
-        key = (edge["from"], edge["to"], edge.get("reason"))
-        if key in seen_edges:
-            continue
-        seen_edges.add(key)
-        dedup_edges.append(edge)
+        graph.append({"file": path, "depth": depth_idx, "dependencies": deps, "error": None})
+
+    pending = sorted(set(frontier + overflow))
+    status = "complete" if not more_available else "partial"
 
     return {
         "root": start_file,
         "ref": used_ref,
         "max_depth": max_depth,
-        "depth_completed": depth,
-        "visited": visited_list,
+        "depth_completed": depth_completed,
+        "visited": visit_order,
+        "visited_count": len(visit_order),
+        "limit_reached": limit_reached,
+        "pending": pending,
         "graph": graph,
         "objects": objects,
-        "edges": dedup_edges,
-        "business_rules": business_rules_all,
-        "implicit_crud": implicit_crud_all,
-        "status": "complete",
+        "edges": edges,
+        "business_rules": business_rules,
+        "implicit_crud": implicit_crud,
+        "status": status,
     }
 
 
-# =========================================
-# /report.paged (cursor-based pagination to avoid timeouts)
-# =========================================
-
-def _b64(data: Dict[str, Any]) -> str:
-    return base64.b64encode(json.dumps(data, separators=(",", ":")).encode("utf-8")).decode("utf-8")
-
-
-def _unb64(token: str) -> Dict[str, Any]:
-    """
-    Decode opaque cursor tokens:
-    - Strips known prefixes (e.g., 'opaque:', 'Bearer ')
-    - Accepts URL-safe base64
-    - Auto-pads to multiple of 4
-    - Raises 400 with a clear message on failure
-    """
-    if not token or not isinstance(token, str):
-        raise HTTPException(400, "Invalid cursor: empty or non-string.")
-
-    cleaned = token.strip()
-    for prefix in ("opaque:", "Opaque:", "bearer ", "Bearer "):
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix) :]
-            break
-
-    cleaned = cleaned.replace("-", "+").replace("_", "/")
-    pad = (-len(cleaned)) % 4
-    if pad:
-        cleaned += "=" * pad
-
-    try:
-        raw = base64.b64decode(cleaned.encode("utf-8"))
-        return json.loads(raw.decode("utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(400, f"Invalid cursor: {exc!s}") from exc
-
-
-def _approx_size(**parts: Any) -> int:
-    """Quick and safe size estimator for response truncation."""
-    try:
-        return len(json.dumps(parts, ensure_ascii=False).encode("utf-8"))
-    except Exception:
-        return 0
-
-
-def _apply_size_budget(max_bytes: int, resp: Dict[str, Any], fields_order: List[str]) -> Tuple[Dict[str, Any], bool]:
-    """
-    Trim list fields to fit under max_bytes budget.
-    Returns (resp, truncated_flag).
-    """
-    truncated = False
-    cur_bytes = _approx_size(**resp)
-    if cur_bytes <= max_bytes:
-        return resp, truncated
-
-    while cur_bytes > max_bytes:
-        reduced = False
-        for field in fields_order:
-            if field not in resp:
-                continue
-            value = resp[field]
-            if isinstance(value, list) and value:
-                drop = max(1, math.ceil(len(value) * 0.15))
-                resp[field] = value[:-drop]
-                truncated = True
-                reduced = True
-                cur_bytes = _approx_size(**resp)
-                if cur_bytes <= max_bytes:
-                    break
-        if not reduced:
-            break
-
-    return resp, truncated
-
-
-async def _paged_bfs_step(
-    used_ref: str,
-    frontier: List[str],
-    visited: Set[str],
-    depth: int,
-    max_depth: int,
-    page_limit_nodes: int,
-    max_concurrency: int,
-    wall_time_s: float,
-) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], int]:
-    """
-    Process a slice of BFS respecting node/page/time limits.
-    Returns:
-    visited_delta, graph_delta, objects_delta, edges_delta, rules_delta, implicit_delta, depth_completed
-    """
-    start_time = time.monotonic()
-    processed = 0
-    graph_delta: List[Dict[str, Any]] = []
-    objects_delta: List[Dict[str, Any]] = []
-    edges_delta: List[Dict[str, Any]] = []
-    rules_delta: List[Dict[str, Any]] = []
-    implicit_delta: List[Dict[str, Any]] = []
-    visited_delta: List[str] = []
-
-    depth_index: Dict[str, int] = {}
-
-    async def safe(file_path: str) -> Dict[str, Any]:
-        try:
-            node = await deps_get(file=file_path, ref=used_ref, page=1, limit=200)  # type: ignore[call-arg]
-            implicit_delta.extend(node.get("implicit_crud", []))
-            dep_paths: List[str] = []
-            for dep in node.get("dependencies", []):
-                clean = _normalize_dep_path(dep.get("path") or "")
-                if _should_skip_dep_path(clean):
-                    continue
-                dep_paths.append(clean)
-            return {"file": file_path, "deps": dep_paths, "error": None}
-        except Exception as exc:  # noqa: BLE001
-            return {"file": file_path, "deps": [], "error": str(exc)}
-
-    sem = Semaphore(max_concurrency)
-
-    async def _guarded(file_path: str) -> Dict[str, Any]:
-        async with sem:
-            return await safe(file_path)
-
-    depth_completed = depth
-    next_frontier: List[str] = []
-
-    cur_level = [f for f in frontier if f not in visited]
-    while cur_level and depth < max_depth:
-        # time guard
-        if (time.monotonic() - start_time) >= wall_time_s:
-            break
-
-        # process this level
-        visited.update(cur_level)
-        visited_delta.extend(cur_level)
-
-        results = await asyncio.gather(*[_guarded(f) for f in cur_level])
-
-        for res in results:
-            if res["error"]:
-                graph_delta.append(
-                    {"file": res["file"], "depth": depth, "dependencies": [], "error": res["error"]}
-                )
-                depth_index[res["file"]] = depth
-                continue
-            deps = res["deps"] or []
-            graph_delta.append({"file": res["file"], "depth": depth, "dependencies": deps, "error": None})
-            depth_index[res["file"]] = depth
-            next_frontier.extend(deps)
-
-        # analyze each visited node this round (bounded)
-        async def _analyze_guarded(path: str) -> Dict[str, Any]:
-            async with sem:
-                return await _analyze_single_file(path, used_ref)
-
-        analyses = await asyncio.gather(*[_analyze_guarded(path) for path in cur_level])
-
-        for analysis in analyses:
-            objects_delta.append(
-                {
-                    "path": analysis.get("path"),
-                    "ref": analysis.get("ref", used_ref),
-                    "sha": analysis.get("sha", "unknown"),
-                    "depth": depth_index.get(analysis.get("path"), -1),
-                    "error": analysis.get("error"),
-                }
-            )
-            for dep in analysis.get("dependencies", []) or []:
-                edges_delta.append(
-                    {
-                        "from": analysis.get("path"),
-                        "to": dep.get("path"),
-                        "reason": dep.get("reason"),
-                        "type": dep.get("type"),
-                        "depth_from_root": depth_index.get(analysis.get("path"), -1) + 1,
-                    }
-                )
-            rules_delta.extend(analysis.get("business_rules", []) or [])
-
-        processed += len(cur_level)
-        if processed >= page_limit_nodes:
-            depth_completed = depth
-            # processed current level up to limit; resume with next_frontier
-            break
-
-        # move to next depth
-        depth += 1
-        cur_level = [f for f in set(next_frontier) if f not in visited]
-        next_frontier = []
-
-        # time guard again
-        if (time.monotonic() - start_time) >= wall_time_s:
-            break
-
-    depth_completed = max(depth_completed, depth)
-    return visited_delta, graph_delta, objects_delta, edges_delta, rules_delta, implicit_delta, depth_completed
-
-
-@app.post("/report.paged")
-@app.get("/report.paged")  # allow GET for connectors that can't POST JSON
-async def report_paged(
-    request: Request,
-    # Body is optional; query params also accepted
-    payload: Optional[Dict[str, Any]] = Body(default=None),
-    start_file: Optional[str] = Query(None),
-    ref: Optional[str] = Query(None),
-    cursor: Optional[str] = Query(None),
-    max_depth: int = Query(DEFAULT_MAX_DEPTH),
-    page_limit_nodes: int = Query(DEFAULT_PAGE_LIMIT_NODES),
-    max_concurrency: int = Query(DEFAULT_MAX_CONCURRENCY),
-    max_bytes: int = Query(DEFAULT_MAX_BYTES),
-    max_wall_time: float = Query(DEFAULT_MAX_WALL_TIME),
-) -> Dict[str, Any]:
+@app.post("/report.firsthop")
+@app.post("/report.firsthop/")
+async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     env = get_env()
+    start_file = payload.get("start_file")
+    if not start_file:
+        raise HTTPException(400, "Missing required field: start_file")
 
-    query_keys = list(request.query_params.keys())
-    cursor_in_query = "cursor" in request.query_params or any(
-        k.lower() == "cursor" for k in request.query_params
-    )
-    log.info(
-        "[report.paged] incoming request; query_keys=%s cursor_in_query=%s content_type=%s",
-        query_keys,
-        cursor_in_query,
-        request.headers.get("content-type"),
-    )
-
-    # --- tolerate weird callers ------------------------------------------------
-    # If the body wasn't parsed but there is a raw body, try to interpret:
-    body: Dict[str, Any] = payload or {}
-    try:
-        if payload is None:
-            raw = await request.body()
-            if raw:
-                text = raw.decode("utf-8", errors="ignore").strip()
-                preview = text[:2000] + ("..." if len(text) > 2000 else "")
-                log.info(
-                    "[report.paged] raw body bytes=%s preview=%s",
-                    len(raw),
-                    preview,
-                )
-                if text and text[0] in "{[":
-                    body = json.loads(text)
-                elif text:
-                    # treat as cursor string
-                    body = {"cursor": text}
-    except Exception:  # noqa: BLE001
-        body = payload or {}
-
-    if body:
-        if isinstance(body, Mapping):
-            log.info(
-                "[report.paged] parsed body keys=%s",
-                list(body.keys()),
-            )
-        else:
-            log.info("[report.paged] parsed body type=%s", type(body))
-
-    def _normalize_key(key: str) -> str:
-        key = re.sub(r"[\s\-]+", "_", key)
-        key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
-        key = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key)
-        key = re.sub(r"_+", "_", key)
-        return key.lower()
-
-    # Pull query params into a plain dict for easier reuse (FastAPI Query uses exact names)
-    query_data: Dict[str, Any] = {k: request.query_params.get(k) for k in request.query_params}
-
-    # Accept alternate keys from legacy callers
-    def first_key(data: Mapping[str, Any], keys: List[str]) -> Optional[Any]:
-        if not isinstance(data, Mapping):
-            return None
-
-        def is_present(value: Any) -> bool:
-            if value is None:
-                return False
-            if isinstance(value, str):
-                return bool(value.strip())
-            if isinstance(value, (list, tuple, set)) and not value:
-                return False
-            return True
-
-        normalized: Dict[str, Any] = {}
-        nested_candidates: List[Mapping[str, Any]] = []
-        for raw_key, value in data.items():
-            if isinstance(value, Mapping):
-                nested_candidates.append(value)
-            elif isinstance(value, list):
-                nested_candidates.extend([item for item in value if isinstance(item, Mapping)])
-
-            if not isinstance(raw_key, str):
-                continue
-            norm = _normalize_key(raw_key)
-            if norm not in normalized and is_present(value):
-                normalized[norm] = value
-
-        for key in keys:
-            norm_key = _normalize_key(key)
-            if norm_key in normalized and is_present(normalized[norm_key]):
-                return normalized[norm_key]
-
-        for nested in nested_candidates:
-            found = first_key(nested, keys)
-            if found is not None:
-                return found
-
-        return None
-
-    def _pull_value(keys: List[str]) -> Optional[Any]:
-        value = first_key(body, keys)
-        if value is None:
-            value = first_key(query_data, keys)
-        return value
-
-    # unify cursor from body or query, accepting alternates
-    cursor_val = _pull_value(["cursor", "next_cursor", "token"])
-    if not cursor_val:
-        cursor_val = cursor
-
-    # ref precedence: body -> query -> env
-    ref_value = _pull_value(["ref", "branch", "branch_name", "version"])
-    used_ref = ref_value or ref or env["REF"]
+    used_ref: str = payload.get("ref") or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
-    log.info("[report.paged] resolved ref=%s (body=%s query=%s)", used_ref, ref_value, ref)
 
-    # numeric knobs: body overrides query if present
-    def _get_int(key: str, default: int) -> int:
-        try:
-            value = _pull_value([key])
-            return int(value if value is not None else default)
-        except Exception:
-            return default
+    analysis = await _analyze_single_file(start_file, used_ref)
+    status = "ok" if not analysis.get("error") else "error"
 
-    def _get_float(key: str, default: float) -> float:
-        try:
-            value = _pull_value([key])
-            return float(value if value is not None else default)
-        except Exception:
-            return default
-
-    max_depth = _get_int("max_depth", max_depth)
-    page_limit_nodes = _get_int("page_limit_nodes", page_limit_nodes)
-    max_concurrency = _get_int("max_concurrency", max_concurrency)
-    max_bytes = _get_int("max_bytes", max_bytes)
-    wall_time = _get_float("max_wall_time", max_wall_time)
-    log.info(
-        "[report.paged] knobs depth=%s page_limit=%s concurrency=%s max_bytes=%s wall_time=%s",
-        max_depth,
-        page_limit_nodes,
-        max_concurrency,
-        max_bytes,
-        wall_time,
-    )
-
-    # Determine the root:
-    # - prefer cursor if present
-    # - else body.start_file | body.file | body.start | body.path
-    # - else query start_file
-    # - else env DEFAULT_START_FILE
-    default_start_file = os.getenv("DEFAULT_START_FILE")
-    if cursor_val:
-        state = _unb64(cursor_val)
-        for key in ("root", "ref", "max_depth", "depth", "frontier", "visited"):
-            if key not in state:
-                raise HTTPException(400, f"Invalid cursor: missing '{key}'.")
-        root = state["root"]
-        used_ref = state["ref"]
-        max_depth = int(state["max_depth"])
-        depth = int(state["depth"])
-        frontier = list(state["frontier"] or [])
-        visited: Set[str] = set(list(state["visited"] or []))
-        log.info(
-            "[report.paged] cursor resume root=%s depth=%s frontier=%s visited=%s",
-            root,
-            depth,
-            len(frontier),
-            len(visited),
-        )
-    else:
-        root_keys = [
-            "start_file",
-            "startfile",
-            "start_file_path",
-            "startfilepath",
-            "file",
-            "file_path",
-            "filepath",
-            "file_path_name",
-            "path",
-            "resource_path",
-            "object_path",
-            "object",
-        ]
-        body_start = _pull_value(root_keys)
-        root = body_start or start_file or default_start_file
-        if not root:
-            body_keys: List[str] = list(body.keys()) if isinstance(body, Mapping) else []
-            log.warning(
-                "[report.paged] missing start_file; body_keys=%s query_keys=%s cursor=%s",
-                body_keys,
-                list(query_data.keys()),
-                bool(cursor_val),
-            )
-            raise HTTPException(
-                400,
-                "Missing required field: start_file (accepts: start_file|file|start|path, "
-                "or provide 'cursor', or set env DEFAULT_START_FILE).",
-            )
-        depth = 0
-        frontier = [root]
-        visited = set()
-        log.info(
-            "[report.paged] new traversal root=%s depth=%s frontier=%s",
-            root,
-            depth,
-            frontier,
+    dep_summary: Dict[str, int] = {}
+    direct: List[Dict[str, Any]] = []
+    for dep in analysis.get("dependencies", []) or []:
+        dtype = dep.get("type", "Unknown")
+        dep_summary[dtype] = dep_summary.get(dtype, 0) + 1
+        direct.append(
+            {
+                "path": dep.get("path"),
+                "type": dep.get("type"),
+                "symbol": dep.get("symbol"),
+                "reason": dep.get("reason"),
+            }
         )
 
-    # run one page
-    (
-        visited_delta,
-        graph_delta,
-        objects_delta,
-        edges_delta,
-        rules_delta,
-        implicit_delta,
-        depth_completed,
-    ) = await _paged_bfs_step(
-        used_ref=used_ref,
-        frontier=frontier,
-        visited=visited,
-        depth=depth,
-        max_depth=max_depth,
-        page_limit_nodes=page_limit_nodes,
-        max_concurrency=max_concurrency,
-        wall_time_s=wall_time,
-    )
-
-    # determine next frontier from nodes at depth_completed
-    next_frontier: List[str] = []
-    for node in graph_delta:
-        if node.get("depth") == depth_completed and not node.get("error"):
-            next_frontier.extend(node.get("dependencies", []))
-    next_frontier = [f for f in set(next_frontier) if f not in visited]
-
-    # Prepare base response
-    resp: Dict[str, Any] = {
-        "root": root,
-        "ref": used_ref,
-        "depth_completed": depth_completed,
-        "objects": objects_delta,
-        "edges": edges_delta,
-        "business_rules": rules_delta,
-        "implicit_crud": implicit_delta,
-        "graph": graph_delta,
-        "visited_delta": visited_delta,
-        "approx_bytes": 0,  # filled after budget
-        "truncated": False,
-        "stats": {
-            "page_nodes": len(visited_delta),
-            "total_seen": len(visited),
-            "page_limit_nodes": page_limit_nodes,
-        },
-        "next_cursor": None,
+    response: Dict[str, Any] = {
+        "root": start_file,
+        "ref": analysis.get("ref", used_ref),
+        "sha": analysis.get("sha", "unknown"),
+        "content_len": analysis.get("content_len", 0),
+        "status": status,
+        "error": analysis.get("error"),
+        "direct_dependencies": direct,
+        "dependency_counts": dep_summary,
+        "implicit_crud": analysis.get("implicit_crud", []),
+        "business_rules": analysis.get("business_rules", []),
+        "total_dependencies": len(direct),
     }
-
-    # attach cursor if more work remains
-    if next_frontier and depth_completed < max_depth:
-        cursor_state = {
-            "root": root,
-            "ref": used_ref,
-            "max_depth": max_depth,
-            "depth": depth_completed + 1,
-            "frontier": next_frontier,
-            "visited": sorted(list(visited)),
-        }
-        resp["next_cursor"] = _b64(cursor_state)
-
-    # size budget
-    order = ["edges", "objects", "business_rules", "implicit_crud", "graph"]
-    sized, truncated = _apply_size_budget(max_bytes, resp, order)
-    sized["truncated"] = truncated
-    sized["approx_bytes"] = _approx_size(**sized)
+    response["approx_bytes"] = _approx_size(response)
     log.info(
-        "[report.paged] approx_bytes=%s truncated=%s next_cursor=%s nodes=%s limit=%s",
-        sized["approx_bytes"],
-        sized["truncated"],
-        bool(sized.get("next_cursor")),
-        len(visited_delta),
-        page_limit_nodes,
+        "[report.firsthop] root=%s deps=%s approx_bytes=%s status=%s",
+        start_file,
+        len(direct),
+        response["approx_bytes"],
+        status,
     )
-    return sized
+    return response
+
+
+@app.post("/report.branch")
+@app.post("/report.branch/")
+async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    env = get_env()
+    start_file: Optional[str] = payload.get("start_file")
+    if not start_file:
+        raise HTTPException(400, "Missing required field: start_file")
+
+    used_ref: str = payload.get("ref") or env["REF"]
+    if str(used_ref).upper() == "HEAD":
+        used_ref = env["REF"]
+
+    try:
+        max_depth = int(payload.get("max_depth", DEFAULT_MAX_DEPTH))
+    except Exception:
+        max_depth = DEFAULT_MAX_DEPTH
+    try:
+        max_files = int(payload.get("max_files", DEFAULT_MAX_FILES))
+    except Exception:
+        max_files = DEFAULT_MAX_FILES
+    try:
+        max_concurrency = int(payload.get("max_concurrency", DEFAULT_MAX_CONCURRENCY))
+    except Exception:
+        max_concurrency = DEFAULT_MAX_CONCURRENCY
+    try:
+        max_bytes = int(payload.get("max_bytes", DEFAULT_MAX_BYTES))
+    except Exception:
+        max_bytes = DEFAULT_MAX_BYTES
+
+    branch = await _collect_branch(
+        start_file=start_file,
+        used_ref=used_ref,
+        max_depth=max_depth,
+        max_files=max_files,
+        max_concurrency=max_concurrency,
+    )
+
+    branch["max_depth"] = max_depth
+    branch["max_files"] = max_files
+    branch["max_concurrency"] = max_concurrency
+    branch["max_bytes"] = max_bytes
+
+    trimmed, truncated = _apply_size_budget(
+        max_bytes,
+        branch,
+        ["edges", "objects", "business_rules", "implicit_crud", "graph"],
+    )
+    trimmed["truncated"] = truncated
+    trimmed["approx_bytes"] = _approx_size(trimmed)
+    log.info(
+        "[report.branch] root=%s depth=%s visited=%s approx_bytes=%s truncated=%s status=%s",
+        start_file,
+        trimmed.get("depth_completed"),
+        trimmed.get("visited_count"),
+        trimmed["approx_bytes"],
+        truncated,
+        trimmed.get("status"),
+    )
+    return trimmed
