@@ -177,6 +177,11 @@ CRUD_SIGNATURE = re.compile(
     re.IGNORECASE,
 )
 
+_CACHE_TTL_SECONDS = int(os.getenv("ITEM_CACHE_TTL", "600"))
+_ITEM_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_NEGATIVE_CACHE: Dict[str, float] = {}
+_CACHE_LOCK = asyncio.Lock()
+
 
 # =========================================
 # HELPERS
@@ -257,11 +262,27 @@ def _classify_on_name_heuristics(symbol: str, suggested_kind: str) -> List[str]:
 
 async def _ado_item_exists(path: str, ref: Optional[str]) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """Ping ADO for the item and tell if it exists (without raising)."""
+    env = get_env()
+    used_ref = ref or env["REF"]
+    if isinstance(used_ref, str) and used_ref.upper() == "HEAD":
+        used_ref = env["REF"]
+    cache_key = f"{path}@{used_ref}"
+    now = time.monotonic()
+    async with _CACHE_LOCK:
+        cached = _ITEM_CACHE.get(cache_key)
+        if cached and (now - cached[0]) <= _CACHE_TTL_SECONDS:
+            return True, cached[1]
+        negative = _NEGATIVE_CACHE.get(cache_key)
+        if negative and (now - negative) <= _CACHE_TTL_SECONDS:
+            return False, None
+
     try:
-        data = await get_item_content(path, ref)
+        data = await get_item_content(path, used_ref)
         return True, data
     except HTTPException as exc:
         if exc.status_code == 404:
+            async with _CACHE_LOCK:
+                _NEGATIVE_CACHE[cache_key] = now
             return False, None
         raise
     except Exception:
@@ -279,6 +300,18 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     used_ref: Optional[str] = ref or env["REF"]
     if isinstance(used_ref, str) and used_ref.upper() == "HEAD":
         used_ref = env["REF"]
+
+    cache_key = f"{path}@{used_ref}"
+    now = time.monotonic()
+    async with _CACHE_LOCK:
+        cached = _ITEM_CACHE.get(cache_key)
+        if cached and (now - cached[0]) <= _CACHE_TTL_SECONDS:
+            log.debug("[cache] hit path=%s ref=%s", path, used_ref)
+            return cached[1]
+        negative = _NEGATIVE_CACHE.get(cache_key)
+        if negative and (now - negative) <= _CACHE_TTL_SECONDS:
+            log.debug("[cache] negative hit path=%s ref=%s", path, used_ref)
+            raise HTTPException(404, f"File not found in ADO: {path}@{used_ref}")
 
     params = {
         "path": f"/{path}" if not path.startswith("/") else path,
@@ -299,6 +332,8 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
             )
 
         if response.status_code == 404:
+            async with _CACHE_LOCK:
+                _NEGATIVE_CACHE[cache_key] = now
             raise HTTPException(404, f"File not found in ADO: {path}@{used_ref}")
 
         try:
@@ -315,6 +350,8 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 
     content = data.get("content")
     if not content:
+        async with _CACHE_LOCK:
+            _NEGATIVE_CACHE[cache_key] = now
         raise HTTPException(404, "No content found for this path (might be binary or empty).")
 
     # base64 -> text if needed
@@ -323,11 +360,16 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    return {
+    result = {
         "content": content,
         "sha": data.get("objectId") or data.get("commitId") or "unknown",
         "ref": used_ref,
     }
+    store_time = time.monotonic()
+    async with _CACHE_LOCK:
+        _ITEM_CACHE[cache_key] = (store_time, result)
+        _NEGATIVE_CACHE.pop(cache_key, None)
+    return result
 
 
 # =========================================
