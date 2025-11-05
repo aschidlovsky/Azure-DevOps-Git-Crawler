@@ -986,6 +986,13 @@ async def report_paged(
     except Exception:  # noqa: BLE001
         body = payload or {}
 
+    def _normalize_key(key: str) -> str:
+        key = re.sub(r"[\s\-]+", "_", key)
+        key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+        key = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key)
+        key = re.sub(r"_+", "_", key)
+        return key.lower()
+
     # Pull query params into a plain dict for easier reuse (FastAPI Query uses exact names)
     query_data: Dict[str, Any] = {k: request.query_params.get(k) for k in request.query_params}
 
@@ -1003,44 +1010,19 @@ async def report_paged(
                 return False
             return True
 
-        # Build a case-insensitive lookup while preserving original keys
-        str_items = {k: data[k] for k in data if isinstance(k, str)}
-        lowered = {k.lower(): k for k in str_items}
+        normalized: Dict[str, Any] = {}
+        for raw_key, value in data.items():
+            if not isinstance(raw_key, str):
+                continue
+            norm = _normalize_key(raw_key)
+            if norm not in normalized and is_present(value):
+                normalized[norm] = value
 
         for key in keys:
-            if key in str_items and is_present(str_items[key]):
-                return str_items[key]
-            actual = lowered.get(key.lower())
-            if actual and is_present(str_items[actual]):
-                return str_items[actual]
+            norm_key = _normalize_key(key)
+            if norm_key in normalized and is_present(normalized[norm_key]):
+                return normalized[norm_key]
         return None
-
-    def _variants(name: str, extra: Optional[List[str]] = None) -> List[str]:
-        variants: List[str] = []
-        seen: Set[str] = set()
-
-        def _add(value: str) -> None:
-            lower = value.lower()
-            if lower not in seen:
-                variants.append(value)
-                seen.add(lower)
-
-        if extra:
-            for item in extra:
-                if isinstance(item, str):
-                    _add(item)
-
-        _add(name)
-        _add(name.lower())
-        if "_" in name:
-            parts = name.split("_")
-            camel = parts[0] + "".join(p.title() for p in parts[1:])
-            pascal = "".join(p.title() for p in parts)
-            _add(camel)
-            _add(pascal)
-        else:
-            _add(name.capitalize())
-        return variants
 
     def _pull_value(keys: List[str]) -> Optional[Any]:
         value = first_key(body, keys)
@@ -1049,12 +1031,12 @@ async def report_paged(
         return value
 
     # unify cursor from body or query, accepting alternates
-    cursor_val = _pull_value(_variants("cursor", ["next_cursor", "token"]))
+    cursor_val = _pull_value(["cursor", "next_cursor", "token"])
     if not cursor_val:
         cursor_val = cursor
 
     # ref precedence: body -> query -> env
-    ref_value = _pull_value(_variants("ref", ["branch", "version", "branch_name"]))
+    ref_value = _pull_value(["ref", "branch", "branch_name", "version"])
     used_ref = ref_value or ref or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
@@ -1062,14 +1044,14 @@ async def report_paged(
     # numeric knobs: body overrides query if present
     def _get_int(key: str, default: int) -> int:
         try:
-            value = _pull_value(_variants(key))
+            value = _pull_value([key])
             return int(value if value is not None else default)
         except Exception:
             return default
 
     def _get_float(key: str, default: float) -> float:
         try:
-            value = _pull_value(_variants(key))
+            value = _pull_value([key])
             return float(value if value is not None else default)
         except Exception:
             return default
@@ -1098,7 +1080,20 @@ async def report_paged(
         frontier = list(state["frontier"] or [])
         visited: Set[str] = set(list(state["visited"] or []))
     else:
-        root_keys = _variants("start_file", ["file", "start", "path", "startfile", "filepath"])
+        root_keys = [
+            "start_file",
+            "startfile",
+            "start_file_path",
+            "startfilepath",
+            "file",
+            "file_path",
+            "filepath",
+            "file_path_name",
+            "path",
+            "resource_path",
+            "object_path",
+            "object",
+        ]
         body_start = _pull_value(root_keys)
         root = body_start or start_file or default_start_file
         if not root:
