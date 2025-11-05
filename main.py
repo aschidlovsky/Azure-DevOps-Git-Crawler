@@ -177,11 +177,30 @@ CRUD_SIGNATURE = re.compile(
     re.IGNORECASE,
 )
 
-_CACHE_TTL_SECONDS = int(os.getenv("ITEM_CACHE_TTL", "600"))
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+DEFAULT_MAX_DEPTH = _env_int("MAX_DEPTH_DEFAULT", 5)
+DEFAULT_PAGE_LIMIT_NODES = _env_int("PAGE_LIMIT_NODES_DEFAULT", 75)
+DEFAULT_MAX_CONCURRENCY = _env_int("MAX_CONCURRENCY_DEFAULT", 6)
+DEFAULT_MAX_BYTES = _env_int("MAX_BYTES_DEFAULT", 350_000)
+DEFAULT_MAX_WALL_TIME = _env_float("MAX_WALL_TIME_DEFAULT", 25.0)
+
+_CACHE_TTL_SECONDS = _env_int("ITEM_CACHE_TTL", 600)
 _ITEM_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _NEGATIVE_CACHE: Dict[str, float] = {}
 _CACHE_LOCK = asyncio.Lock()
-
 
 # =========================================
 # HELPERS
@@ -1004,11 +1023,11 @@ async def report_paged(
     start_file: Optional[str] = Query(None),
     ref: Optional[str] = Query(None),
     cursor: Optional[str] = Query(None),
-    max_depth: int = Query(5),
-    page_limit_nodes: int = Query(200),
-    max_concurrency: int = Query(8),
-    max_bytes: int = Query(1_200_000),
-    max_wall_time: float = Query(25.0),
+    max_depth: int = Query(DEFAULT_MAX_DEPTH),
+    page_limit_nodes: int = Query(DEFAULT_PAGE_LIMIT_NODES),
+    max_concurrency: int = Query(DEFAULT_MAX_CONCURRENCY),
+    max_bytes: int = Query(DEFAULT_MAX_BYTES),
+    max_wall_time: float = Query(DEFAULT_MAX_WALL_TIME),
 ) -> Dict[str, Any]:
     env = get_env()
 
@@ -1272,4 +1291,12 @@ async def report_paged(
     sized, truncated = _apply_size_budget(max_bytes, resp, order)
     sized["truncated"] = truncated
     sized["approx_bytes"] = _approx_size(**sized)
+    log.info(
+        "[report.paged] approx_bytes=%s truncated=%s next_cursor=%s nodes=%s limit=%s",
+        sized["approx_bytes"],
+        sized["truncated"],
+        bool(sized.get("next_cursor")),
+        len(visited_delta),
+        page_limit_nodes,
+    )
     return sized
