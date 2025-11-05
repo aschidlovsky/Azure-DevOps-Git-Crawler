@@ -424,6 +424,24 @@
           "total_dependencies": {
             "type": "integer"
           },
+          "entry_methods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MethodHit"
+            }
+          },
+          "crud_methods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MethodHit"
+            }
+          },
+          "allow_flags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AllowFlag"
+            }
+          },
           "approx_bytes": {
             "type": "integer"
           }
@@ -468,6 +486,24 @@
           "error": {
             "type": "string",
             "nullable": true
+          },
+          "entry_methods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MethodHit"
+            }
+          },
+          "crud_methods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MethodHit"
+            }
+          },
+          "allow_flags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AllowFlag"
+            }
           }
         }
       },
@@ -572,6 +608,69 @@
           },
           "approx_bytes": {
             "type": "integer"
+          },
+          "method_summary": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MethodSummary"
+            }
+          }
+        }
+      },
+      "MethodHit": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "signature": {
+            "type": "string"
+          }
+        }
+      },
+      "AllowFlag": {
+        "type": "object",
+        "properties": {
+          "property": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "context": {
+            "type": "string"
+          }
+        }
+      },
+      "MethodSummary": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "entry_methods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MethodHit"
+            }
+          },
+          "crud_methods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MethodHit"
+            }
+          },
+          "allow_flags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AllowFlag"
+            }
           }
         }
       }

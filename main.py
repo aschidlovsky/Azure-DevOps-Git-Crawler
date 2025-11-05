@@ -176,6 +176,19 @@ CRUD_SIGNATURE = re.compile(
     re.IGNORECASE,
 )
 
+ENTRY_METHOD_NAMES = {"init", "run", "clicked", "write"}
+CRUD_METHOD_NAMES = {"insert", "update", "delete", "write", "validatewrite", "validatedelete"}
+METHOD_DEF_PATTERN = re.compile(
+    r"^\s*(public|protected|private)?\s+(static\s+)?(final\s+)?"
+    r"(void|boolean|int|real|str|container|date|utcdatetime|anytype|guid|number|variant|time)\s+"
+    r"(?P<name>[A-Za-z0-9_]+)\s*\(",
+    re.IGNORECASE,
+)
+ALLOW_FLAG_PATTERN = re.compile(
+    r"\bAllow(Create|Edit|Delete)\b\s*[:=]\s*(Yes|No)",
+    re.IGNORECASE,
+)
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -427,6 +440,11 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     implicit: List[Dict[str, Any]] = []
     business: List[Dict[str, Any]] = []
     dep_keys: Set[str] = set()
+    entry_methods: List[Dict[str, Any]] = []
+    crud_methods: List[Dict[str, Any]] = []
+    seen_entry: Set[str] = set()
+    seen_crud: Set[str] = set()
+    allow_flags: List[Dict[str, Any]] = []
 
     # direct deps
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
@@ -488,6 +506,28 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         if any(token in line for token in ["validate", "error(", "ttsBegin", "ttsCommit"]):
             business.append({"line": line_no, "context": line.strip()[:200]})
 
+        method_match = METHOD_DEF_PATTERN.match(line)
+        if method_match:
+            name = method_match.group("name") or ""
+            lower = name.lower()
+            info = {"name": name, "line": line_no, "signature": line.strip()[:200]}
+            if lower in ENTRY_METHOD_NAMES and lower not in seen_entry:
+                entry_methods.append(info)
+                seen_entry.add(lower)
+            if lower in CRUD_METHOD_NAMES and lower not in seen_crud:
+                crud_methods.append(info)
+                seen_crud.add(lower)
+
+        allow_match = ALLOW_FLAG_PATTERN.search(line)
+        if allow_match:
+            flag = {
+                "property": f"Allow{allow_match.group(1)}",
+                "value": allow_match.group(2).capitalize(),
+                "line": line_no,
+                "context": line.strip()[:200],
+            }
+            allow_flags.append(flag)
+
     log.info(
         "[extract] file=%s deps=%d ds=%d crud=%d rules=%d",
         file_path or "<mem>",
@@ -496,7 +536,14 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         len(implicit),
         len(business),
     )
-    return {"dependencies": deps, "implicit_crud": implicit, "business_rules": business}
+    return {
+        "dependencies": deps,
+        "implicit_crud": implicit,
+        "business_rules": business,
+        "entry_methods": entry_methods,
+        "crud_methods": crud_methods,
+        "allow_flags": allow_flags,
+    }
 
 
 # =========================================
@@ -668,6 +715,7 @@ async def _collect_branch(
     depths: Dict[str, int] = {}
     visit_order: List[str] = []
     overflow: List[str] = []
+    method_summary: List[Dict[str, Any]] = []
 
     async def _analyze_guarded(path: str) -> Dict[str, Any]:
         if path in analysis_cache:
@@ -730,6 +778,17 @@ async def _collect_branch(
     for path in visit_order:
         analysis = await _analyze_guarded(path)
         depth_idx = depths.get(path, -1)
+        entry_methods = analysis.get("entry_methods", [])
+        crud_methods = analysis.get("crud_methods", [])
+        allow_flags = analysis.get("allow_flags", [])
+        method_summary.append(
+            {
+                "path": path,
+                "entry_methods": entry_methods,
+                "crud_methods": crud_methods,
+                "allow_flags": allow_flags,
+            }
+        )
         objects.append(
             {
                 "path": analysis.get("path", path),
@@ -737,6 +796,9 @@ async def _collect_branch(
                 "sha": analysis.get("sha", "unknown"),
                 "depth": depth_idx,
                 "error": analysis.get("error"),
+                "entry_methods": entry_methods,
+                "crud_methods": crud_methods,
+                "allow_flags": allow_flags,
             }
         )
 
@@ -787,6 +849,7 @@ async def _collect_branch(
         "business_rules": business_rules,
         "implicit_crud": implicit_crud,
         "status": status,
+        "method_summary": method_summary,
     }
 
 
@@ -831,6 +894,9 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
         "implicit_crud": analysis.get("implicit_crud", []),
         "business_rules": analysis.get("business_rules", []),
         "total_dependencies": len(direct),
+        "entry_methods": analysis.get("entry_methods", []),
+        "crud_methods": analysis.get("crud_methods", []),
+        "allow_flags": analysis.get("allow_flags", []),
     }
     response["approx_bytes"] = _approx_size(response)
     log.info(
@@ -888,7 +954,7 @@ async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     trimmed, truncated = _apply_size_budget(
         max_bytes,
         branch,
-        ["edges", "objects", "business_rules", "implicit_crud", "graph"],
+        ["edges", "objects", "business_rules", "implicit_crud", "graph", "method_summary"],
     )
     trimmed["truncated"] = truncated
     trimmed["approx_bytes"] = _approx_size(trimmed)
