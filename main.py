@@ -970,6 +970,17 @@ async def report_paged(
 ) -> Dict[str, Any]:
     env = get_env()
 
+    query_keys = list(request.query_params.keys())
+    cursor_in_query = "cursor" in request.query_params or any(
+        k.lower() == "cursor" for k in request.query_params
+    )
+    log.info(
+        "[report.paged] incoming request; query_keys=%s cursor_in_query=%s content_type=%s",
+        query_keys,
+        cursor_in_query,
+        request.headers.get("content-type"),
+    )
+
     # --- tolerate weird callers ------------------------------------------------
     # If the body wasn't parsed but there is a raw body, try to interpret:
     body: Dict[str, Any] = payload or {}
@@ -978,6 +989,12 @@ async def report_paged(
             raw = await request.body()
             if raw:
                 text = raw.decode("utf-8", errors="ignore").strip()
+                preview = text[:2000] + ("..." if len(text) > 2000 else "")
+                log.info(
+                    "[report.paged] raw body bytes=%s preview=%s",
+                    len(raw),
+                    preview,
+                )
                 if text and text[0] in "{[":
                     body = json.loads(text)
                 elif text:
@@ -985,6 +1002,15 @@ async def report_paged(
                     body = {"cursor": text}
     except Exception:  # noqa: BLE001
         body = payload or {}
+
+    if body:
+        if isinstance(body, Mapping):
+            log.info(
+                "[report.paged] parsed body keys=%s",
+                list(body.keys()),
+            )
+        else:
+            log.info("[report.paged] parsed body type=%s", type(body))
 
     def _normalize_key(key: str) -> str:
         key = re.sub(r"[\s\-]+", "_", key)
@@ -1011,7 +1037,13 @@ async def report_paged(
             return True
 
         normalized: Dict[str, Any] = {}
+        nested_candidates: List[Mapping[str, Any]] = []
         for raw_key, value in data.items():
+            if isinstance(value, Mapping):
+                nested_candidates.append(value)
+            elif isinstance(value, list):
+                nested_candidates.extend([item for item in value if isinstance(item, Mapping)])
+
             if not isinstance(raw_key, str):
                 continue
             norm = _normalize_key(raw_key)
@@ -1022,6 +1054,12 @@ async def report_paged(
             norm_key = _normalize_key(key)
             if norm_key in normalized and is_present(normalized[norm_key]):
                 return normalized[norm_key]
+
+        for nested in nested_candidates:
+            found = first_key(nested, keys)
+            if found is not None:
+                return found
+
         return None
 
     def _pull_value(keys: List[str]) -> Optional[Any]:
@@ -1040,6 +1078,7 @@ async def report_paged(
     used_ref = ref_value or ref or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
+    log.info("[report.paged] resolved ref=%s (body=%s query=%s)", used_ref, ref_value, ref)
 
     # numeric knobs: body overrides query if present
     def _get_int(key: str, default: int) -> int:
@@ -1079,6 +1118,13 @@ async def report_paged(
         depth = int(state["depth"])
         frontier = list(state["frontier"] or [])
         visited: Set[str] = set(list(state["visited"] or []))
+        log.info(
+            "[report.paged] cursor resume root=%s depth=%s frontier=%s visited=%s",
+            root,
+            depth,
+            len(frontier),
+            len(visited),
+        )
     else:
         root_keys = [
             "start_file",
@@ -1097,6 +1143,13 @@ async def report_paged(
         body_start = _pull_value(root_keys)
         root = body_start or start_file or default_start_file
         if not root:
+            body_keys: List[str] = list(body.keys()) if isinstance(body, Mapping) else []
+            log.warning(
+                "[report.paged] missing start_file; body_keys=%s query_keys=%s cursor=%s",
+                body_keys,
+                list(query_data.keys()),
+                bool(cursor_val),
+            )
             raise HTTPException(
                 400,
                 "Missing required field: start_file (accepts: start_file|file|start|path, "
@@ -1105,6 +1158,12 @@ async def report_paged(
         depth = 0
         frontier = [root]
         visited = set()
+        log.info(
+            "[report.paged] new traversal root=%s depth=%s frontier=%s",
+            root,
+            depth,
+            frontier,
+        )
 
     # run one page
     (
