@@ -878,18 +878,24 @@ def _apply_size_budget(max_bytes: int, resp: Dict[str, Any], fields_order: List[
     cur_bytes = _approx_size(**resp)
     if cur_bytes <= max_bytes:
         return resp, truncated
-    for field in fields_order:
-        if field not in resp:
-            continue
-        value = resp[field]
-        if isinstance(value, list) and value:
-            # drop from the tail in chunks
-            drop = max(1, math.ceil(len(value) * 0.15))
-            resp[field] = value[:-drop]
-            truncated = True
-            cur_bytes = _approx_size(**resp)
-            if cur_bytes <= max_bytes:
-                break
+
+    while cur_bytes > max_bytes:
+        reduced = False
+        for field in fields_order:
+            if field not in resp:
+                continue
+            value = resp[field]
+            if isinstance(value, list) and value:
+                drop = max(1, math.ceil(len(value) * 0.15))
+                resp[field] = value[:-drop]
+                truncated = True
+                reduced = True
+                cur_bytes = _approx_size(**resp)
+                if cur_bytes <= max_bytes:
+                    break
+        if not reduced:
+            break
+
     return resp, truncated
 
 
@@ -1161,6 +1167,14 @@ async def report_paged(
     max_concurrency = _get_int("max_concurrency", max_concurrency)
     max_bytes = _get_int("max_bytes", max_bytes)
     wall_time = _get_float("max_wall_time", max_wall_time)
+    log.info(
+        "[report.paged] knobs depth=%s page_limit=%s concurrency=%s max_bytes=%s wall_time=%s",
+        max_depth,
+        page_limit_nodes,
+        max_concurrency,
+        max_bytes,
+        wall_time,
+    )
 
     # Determine the root:
     # - prefer cursor if present
