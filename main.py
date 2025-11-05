@@ -7,6 +7,7 @@ import os
 import re
 import time
 from asyncio import Semaphore
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
@@ -985,34 +986,90 @@ async def report_paged(
     except Exception:  # noqa: BLE001
         body = payload or {}
 
+    # Pull query params into a plain dict for easier reuse (FastAPI Query uses exact names)
+    query_data: Dict[str, Any] = {k: request.query_params.get(k) for k in request.query_params}
+
     # Accept alternate keys from legacy callers
-    def first_key(data: Dict[str, Any], keys: List[str]) -> Optional[Any]:
+    def first_key(data: Mapping[str, Any], keys: List[str]) -> Optional[Any]:
+        if not isinstance(data, Mapping):
+            return None
+
+        def is_present(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, (list, tuple, set)) and not value:
+                return False
+            return True
+
+        # Build a case-insensitive lookup while preserving original keys
+        str_items = {k: data[k] for k in data if isinstance(k, str)}
+        lowered = {k.lower(): k for k in str_items}
+
         for key in keys:
-            if key in data and data[key] not in (None, "", []):
-                return data[key]
+            if key in str_items and is_present(str_items[key]):
+                return str_items[key]
+            actual = lowered.get(key.lower())
+            if actual and is_present(str_items[actual]):
+                return str_items[actual]
         return None
 
+    def _variants(name: str, extra: Optional[List[str]] = None) -> List[str]:
+        variants: List[str] = []
+        seen: Set[str] = set()
+
+        def _add(value: str) -> None:
+            lower = value.lower()
+            if lower not in seen:
+                variants.append(value)
+                seen.add(lower)
+
+        if extra:
+            for item in extra:
+                if isinstance(item, str):
+                    _add(item)
+
+        _add(name)
+        _add(name.lower())
+        if "_" in name:
+            parts = name.split("_")
+            camel = parts[0] + "".join(p.title() for p in parts[1:])
+            pascal = "".join(p.title() for p in parts)
+            _add(camel)
+            _add(pascal)
+        else:
+            _add(name.capitalize())
+        return variants
+
+    def _pull_value(keys: List[str]) -> Optional[Any]:
+        value = first_key(body, keys)
+        if value is None:
+            value = first_key(query_data, keys)
+        return value
+
     # unify cursor from body or query, accepting alternates
-    cursor_val = first_key(body if isinstance(body, dict) else {}, ["cursor", "next_cursor", "token"])
+    cursor_val = _pull_value(_variants("cursor", ["next_cursor", "token"]))
     if not cursor_val:
         cursor_val = cursor
 
     # ref precedence: body -> query -> env
-    used_ref = first_key(body if isinstance(body, dict) else {}, ["ref", "branch", "version"]) or ref or env["REF"]
+    ref_value = _pull_value(_variants("ref", ["branch", "version", "branch_name"]))
+    used_ref = ref_value or ref or env["REF"]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
 
     # numeric knobs: body overrides query if present
     def _get_int(key: str, default: int) -> int:
         try:
-            value = first_key(body if isinstance(body, dict) else {}, [key])
+            value = _pull_value(_variants(key))
             return int(value if value is not None else default)
         except Exception:
             return default
 
     def _get_float(key: str, default: float) -> float:
         try:
-            value = first_key(body if isinstance(body, dict) else {}, [key])
+            value = _pull_value(_variants(key))
             return float(value if value is not None else default)
         except Exception:
             return default
@@ -1041,7 +1098,8 @@ async def report_paged(
         frontier = list(state["frontier"] or [])
         visited: Set[str] = set(list(state["visited"] or []))
     else:
-        body_start = first_key(body if isinstance(body, dict) else {}, ["start_file", "file", "start", "path"])
+        root_keys = _variants("start_file", ["file", "start", "path", "startfile", "filepath"])
+        body_start = _pull_value(root_keys)
         root = body_start or start_file or default_start_file
         if not root:
             raise HTTPException(
