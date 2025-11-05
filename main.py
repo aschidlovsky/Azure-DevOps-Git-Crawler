@@ -2,6 +2,9 @@ import os, base64, re, json, logging, asyncio, time, math
 from typing import Dict, Any, List, Set, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.responses import JSONResponse
+from typing import Union
 import httpx
 from asyncio import Semaphore
 
@@ -19,6 +22,22 @@ app.add_middleware(
 )
 
 log = logging.getLogger("uvicorn.error")
+
+# ADD this global handler (after app init) to turn 422 into 400 with details
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "Bad Request",
+            "detail": "Invalid or missing request payload for this endpoint.",
+            "hints": [
+                "Send JSON with Content-Type: application/json.",
+                "For /report.paged: either provide start_file (+ optional ref, max_depth, etc.) or provide cursor.",
+            ],
+            "pydantic": exc.errors(),
+        },
+    )
 
 # =========================================
 # ENV + AUTH
@@ -792,33 +811,52 @@ async def _paged_bfs_step(
     return visited_delta, graph_delta, objects_delta, edges_delta, rules_delta, implicit_delta, depth_completed
 
 @app.post("/report.paged")
-async def report_paged(payload: Dict[str, Any] = Body(...)):
-    """
-    Cursor-based, paged report to avoid timeouts.
-    Request (first page):
-      {
-        "start_file": "Forms/mssBDAckTableFurn.xpo",
-        "ref": "main",
-        "max_depth": 5,
-        "page_limit_nodes": 200,
-        "max_concurrency": 8,
-        "max_bytes": 1200000,
-        "max_wall_time": 25
-      }
-    Or continue with:
-      { "cursor": "<opaque string>" }
-    """
+@app.get("/report.paged")  # allow GET for connectors that can't POST JSON
+async def report_paged(
+    # Body is optional; we also accept query params for all fields.
+    payload: Optional[Dict[str, Any]] = Body(default=None),
+    start_file: Optional[str] = Query(None),
+    ref: Optional[str] = Query(None),
+    cursor: Optional[str] = Query(None),
+    max_depth: int = Query(5),
+    page_limit_nodes: int = Query(200),
+    max_concurrency: int = Query(8),
+    max_bytes: int = Query(1200000),
+    max_wall_time: float = Query(25.0),
+):
     env = get_env()
-    max_bytes = int(payload.get("max_bytes", int(os.getenv("MAX_BYTES", "1200000"))))
-    max_concurrency = int(payload.get("max_concurrency", int(os.getenv("MAX_CONCURRENCY", "8"))))
-    page_limit_nodes = int(payload.get("page_limit_nodes", 200))
-    wall_time = float(payload.get("max_wall_time", 25.0))
 
-    cursor_val = payload.get("cursor")
+    # unify inputs: prefer body if present, else query
+    body = payload or {}
+    cursor_val = body.get("cursor") if isinstance(body, dict) else None
+    cursor_val = cursor_val or cursor
 
+    used_ref = (body.get("ref") if isinstance(body, dict) else None) or ref or env["REF"]
+    if str(used_ref).upper() == "HEAD":
+        used_ref = env["REF"]
+
+    # numeric knobs: body overrides query if present
+    def _get_int(key: str, default: int) -> int:
+        try:
+            return int(body.get(key, default))
+        except Exception:
+            return default
+
+    def _get_float(key: str, default: float) -> float:
+        try:
+            return float(body.get(key, default))
+        except Exception:
+            return default
+
+    max_depth = _get_int("max_depth", max_depth)
+    page_limit_nodes = _get_int("page_limit_nodes", page_limit_nodes)
+    max_concurrency = _get_int("max_concurrency", max_concurrency)
+    max_bytes = _get_int("max_bytes", max_bytes)
+    wall_time = _get_float("max_wall_time", max_wall_time)
+
+    # establish root/frontier/visited based on cursor or start_file
     if cursor_val:
         state = _unb64(cursor_val)
-        # sanity-check required keys
         for k in ("root", "ref", "max_depth", "depth", "frontier", "visited"):
             if k not in state:
                 raise HTTPException(400, f"Invalid cursor: missing '{k}'.")
@@ -827,21 +865,15 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
         max_depth = int(state["max_depth"])
         depth = int(state["depth"])
         frontier = list(state["frontier"] or [])
-        visited_list = list(state["visited"] or [])
-        visited: Set[str] = set(visited_list)
+        visited: Set[str] = set(list(state["visited"] or []))
     else:
-        root = payload.get("start_file")
+        root = (body.get("start_file") if isinstance(body, dict) else None) or start_file
         if not root:
             raise HTTPException(400, "Missing required field: start_file (or provide a valid cursor).")
-        used_ref = payload.get("ref") or env["REF"]
-        if str(used_ref).upper() == "HEAD":
-            used_ref = env["REF"]
-        max_depth = int(payload.get("max_depth", 5))
         depth = 0
         frontier = [root]
         visited = set()
 
-    # run one page
     visited_delta, graph_delta, objects_delta, edges_delta, rules_delta, implicit_delta, depth_completed = await _paged_bfs_step(
         used_ref=used_ref,
         frontier=frontier,
@@ -853,14 +885,12 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
         wall_time_s=wall_time,
     )
 
-    # determine next frontier from nodes at depth_completed
     next_frontier: List[str] = []
     for g in graph_delta:
         if g.get("depth") == depth_completed and not g.get("error"):
             next_frontier.extend(g.get("dependencies", []))
     next_frontier = [f for f in set(next_frontier) if f not in visited]
 
-    # Prepare base response
     resp: Dict[str, Any] = {
         "root": root,
         "ref": used_ref,
@@ -871,7 +901,7 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
         "implicit_crud": implicit_delta,
         "graph": graph_delta,
         "visited_delta": visited_delta,
-        "approx_bytes": 0,            # filled after budget
+        "approx_bytes": 0,
         "truncated": False,
         "stats": {
             "page_nodes": len(visited_delta),
@@ -881,7 +911,6 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
         "next_cursor": None
     }
 
-    # attach cursor if more work remains
     if next_frontier and depth_completed < max_depth:
         cursor_state = {
             "root": root,
@@ -893,7 +922,6 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
         }
         resp["next_cursor"] = _b64(cursor_state)
 
-    # size budget
     order = ["edges", "objects", "business_rules", "implicit_crud", "graph"]
     sized, truncated = _apply_size_budget(max_bytes, resp, order)
     sized["truncated"] = truncated
