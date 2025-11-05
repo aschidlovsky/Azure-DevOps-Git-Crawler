@@ -1,0 +1,713 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "ADO Repo Dependency Connector",
+    "version": "1.3.2",
+    "description": "Custom API for browsing Azure DevOps XPO repositories and extracting dependency graphs."
+  },
+  "servers": [
+    {
+      "url": "https://your-host-name.example.com",
+      "description": "Deployed service URL"
+    },
+    {
+      "url": "http://localhost:8080",
+      "description": "Local development"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health Check",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "Service is up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/file": {
+      "get": {
+        "summary": "Fetch File Content",
+        "operationId": "getFile",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Repository-relative path (e.g. Forms/CustTable.xpo)"
+          },
+          {
+            "name": "ref",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Branch or tag; defaults to DEFAULT_REF"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "File not found"
+          }
+        }
+      }
+    },
+    "/deps": {
+      "get": {
+        "summary": "Extract Direct Dependencies",
+        "operationId": "getDeps",
+        "parameters": [
+          {
+            "name": "file",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Path to the .xpo file"
+          },
+          {
+            "name": "ref",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 200,
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dependencies found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DepsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Source file not found"
+          }
+        }
+      }
+    },
+    "/resolve": {
+      "post": {
+        "summary": "Breadth-First Dependency Crawl",
+        "operationId": "postResolve",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Traversal completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResolveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing start_file or invalid parameters"
+          }
+        }
+      }
+    },
+    "/report": {
+      "post": {
+        "summary": "Full Dependency Report",
+        "operationId": "postReport",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Report generated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing start_file or invalid parameters"
+          }
+        }
+      }
+    },
+    "/report.paged": {
+      "get": {
+        "summary": "Paged Dependency Report (GET)",
+        "operationId": "getReportPaged",
+        "parameters": [
+          {
+            "name": "start_file",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Starting file for traversal. Required when no cursor is supplied."
+          },
+          {
+            "name": "ref",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque cursor returned by the previous page."
+          },
+          {
+            "name": "max_depth",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 5
+            }
+          },
+          {
+            "name": "page_limit_nodes",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 200
+            }
+          },
+          {
+            "name": "max_concurrency",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 8
+            }
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 1200000
+            }
+          },
+          {
+            "name": "max_wall_time",
+            "in": "query",
+            "schema": {
+              "type": "number",
+              "format": "float",
+              "default": 25.0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PagedReportResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing start_file and no cursor provided"
+          }
+        }
+      },
+      "post": {
+        "summary": "Paged Dependency Report (POST)",
+        "operationId": "postReportPaged",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "start_file": {
+                    "type": "string",
+                    "description": "Required when no cursor is provided. Example: Forms/CustTable.xpo"
+                  },
+                  "ref": {
+                    "type": "string",
+                    "description": "Branch or tag; defaults to DEFAULT_REF"
+                  },
+                  "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor string returned by a previous call"
+                  },
+                  "max_depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 5
+                  },
+                  "page_limit_nodes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 200
+                  },
+                  "max_concurrency": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 8
+                  },
+                  "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "default": 1200000
+                  },
+                  "max_wall_time": {
+                    "type": "number",
+                    "format": "float",
+                    "minimum": 1,
+                    "default": 25.0
+                  }
+                },
+                "required": ["start_file"],
+                "oneOf": [
+                  {
+                    "required": ["cursor"]
+                  },
+                  {
+                    "required": ["start_file"]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Page returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PagedReportResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing start_file and no cursor provided"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "FileResponse": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "sha": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          }
+        }
+      },
+      "Dependency": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "Table",
+              "Class",
+              "Form",
+              "Map",
+              "Unknown"
+            ]
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "ImplicitCrud": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "caller": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "BusinessRule": {
+        "type": "object",
+        "properties": {
+          "line": {
+            "type": "integer"
+          },
+          "context": {
+            "type": "string"
+          }
+        }
+      },
+      "DepsResponse": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "sha": {
+            "type": "string"
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Dependency"
+            }
+          },
+          "business_rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BusinessRule"
+            }
+          },
+          "implicit_crud": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImplicitCrud"
+            }
+          },
+          "unresolved": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "visited": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "page": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "total_dependencies": {
+            "type": "integer"
+          },
+          "total_pages": {
+            "type": "integer"
+          }
+        }
+      },
+      "ResolveRequest": {
+        "type": "object",
+        "required": [
+          "start_file"
+        ],
+        "properties": {
+          "start_file": {
+            "type": "string",
+            "description": "Starting .xpo path for traversal"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "max_depth": {
+            "type": "integer",
+            "default": 5
+          }
+        }
+      },
+      "ResolveResponse": {
+        "type": "object",
+        "properties": {
+          "root": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "max_depth": {
+            "type": "integer"
+          },
+          "depth_completed": {
+            "type": "integer"
+          },
+          "total_files": {
+            "type": "integer"
+          },
+          "visited": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "implicit_crud": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImplicitCrud"
+            }
+          },
+          "graph": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "status": {
+            "type": "string",
+            "example": "complete"
+          }
+        }
+      },
+      "ReportRequest": {
+        "type": "object",
+        "required": [
+          "start_file"
+        ],
+        "properties": {
+          "start_file": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "max_depth": {
+            "type": "integer",
+            "default": 5
+          },
+          "max_concurrency": {
+            "type": "integer",
+            "default": 8
+          }
+        }
+      },
+      "ReportResponse": {
+        "type": "object",
+        "properties": {
+          "root": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "max_depth": {
+            "type": "integer"
+          },
+          "depth_completed": {
+            "type": "integer"
+          },
+          "visited": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "graph": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "objects": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "business_rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BusinessRule"
+            }
+          },
+          "implicit_crud": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImplicitCrud"
+            }
+          },
+          "status": {
+            "type": "string",
+            "example": "complete"
+          }
+        }
+      },
+      "PagedReportResponse": {
+        "type": "object",
+        "properties": {
+          "root": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "depth_completed": {
+            "type": "integer"
+          },
+          "objects": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "business_rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BusinessRule"
+            }
+          },
+          "implicit_crud": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImplicitCrud"
+            }
+          },
+          "graph": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "visited_delta": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "approx_bytes": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "stats": {
+            "type": "object"
+          },
+          "next_cursor": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      }
+    }
+  }
+}
