@@ -1,4 +1,3 @@
-```python
 import os, base64, re, json, logging, asyncio, time, math
 from typing import Dict, Any, List, Set, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Query, Body
@@ -900,4 +899,3 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
     sized["truncated"] = truncated
     sized["approx_bytes"] = _approx_size(**sized)
     return sized
-```
