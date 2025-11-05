@@ -1,8 +1,10 @@
+```python
 import os, base64, re, json, logging, asyncio, time, math
 from typing import Dict, Any, List, Set, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
+from asyncio import Semaphore
 
 # =========================================
 # APP INIT
@@ -459,8 +461,6 @@ async def resolve_post(payload: Dict[str, Any] = Body(...)):
 # =========================================
 # /report (full transitive, single-call)
 # =========================================
-from asyncio import Semaphore
-
 async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
     # fetch file
     try:
@@ -619,8 +619,34 @@ async def report_post(payload: Dict[str, Any] = Body(...)):
 def _b64(data: Dict[str, Any]) -> str:
     return base64.b64encode(json.dumps(data, separators=(",", ":")).encode("utf-8")).decode("utf-8")
 
+# --- patched robust decoder ---
 def _unb64(tok: str) -> Dict[str, Any]:
-    return json.loads(base64.b64decode(tok.encode("utf-8")).decode("utf-8"))
+    """
+    Decode opaque cursor tokens:
+    - Strips known prefixes (e.g., 'opaque:', 'Bearer ')
+    - Accepts URL-safe base64
+    - Auto-pads to multiple of 4
+    - Raises 400 with a clear message on failure
+    """
+    if not tok or not isinstance(tok, str):
+        raise HTTPException(400, "Invalid cursor: empty or non-string.")
+
+    t = tok.strip()
+    for pref in ("opaque:", "Opaque:", "bearer ", "Bearer "):
+        if t.startswith(pref):
+            t = t[len(pref):]
+            break
+
+    t = t.replace("-", "+").replace("_", "/")
+    pad = (-len(t)) % 4
+    if pad:
+        t += "=" * pad
+
+    try:
+        raw = base64.b64decode(t.encode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(400, f"Invalid cursor: {e!s}")
 
 def _approx_size(**parts) -> int:
     """Quick and safe size estimator for response truncation."""
@@ -661,7 +687,7 @@ async def _paged_bfs_step(
     page_limit_nodes: int,
     max_concurrency: int,
     wall_time_s: float,
-) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[str], int]:
+) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], int]:
     """
     Process a slice of BFS respecting node/page/time limits.
     Returns:
@@ -751,9 +777,7 @@ async def _paged_bfs_step(
         processed += len(cur_level)
         if processed >= page_limit_nodes:
             depth_completed = depth
-            # prepare cursor to resume either from remaining in this level or next level
-            leftover = list(set(cur_level) - set([o["path"] for o in objects_delta if o.get("path")]))
-            # We actually processed all in cur_level; resume with next_frontier
+            # processed current level up to limit; resume with next_frontier
             break
 
         # move to next depth
@@ -791,19 +815,25 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
     page_limit_nodes = int(payload.get("page_limit_nodes", 200))
     wall_time = float(payload.get("max_wall_time", 25.0))
 
-    if "cursor" in payload and payload["cursor"]:
-        state = _unb64(payload["cursor"])
+    cursor_val = payload.get("cursor")
+
+    if cursor_val:
+        state = _unb64(cursor_val)
+        # sanity-check required keys
+        for k in ("root", "ref", "max_depth", "depth", "frontier", "visited"):
+            if k not in state:
+                raise HTTPException(400, f"Invalid cursor: missing '{k}'.")
         root = state["root"]
         used_ref = state["ref"]
-        max_depth = state["max_depth"]
-        depth = state["depth"]
-        frontier = state["frontier"]
-        visited_list = state["visited"]
+        max_depth = int(state["max_depth"])
+        depth = int(state["depth"])
+        frontier = list(state["frontier"] or [])
+        visited_list = list(state["visited"] or [])
         visited: Set[str] = set(visited_list)
     else:
         root = payload.get("start_file")
         if not root:
-            raise HTTPException(400, "Missing required field: start_file")
+            raise HTTPException(400, "Missing required field: start_file (or provide a valid cursor).")
         used_ref = payload.get("ref") or env["REF"]
         if str(used_ref).upper() == "HEAD":
             used_ref = env["REF"]
@@ -824,9 +854,7 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
         wall_time_s=wall_time,
     )
 
-    # prepare next cursor
-    # Next frontier = children of the last processed level that we didn't cover yet.
-    # We reconstruct it from graph_delta for nodes exactly at 'depth_completed'.
+    # determine next frontier from nodes at depth_completed
     next_frontier: List[str] = []
     for g in graph_delta:
         if g.get("depth") == depth_completed and not g.get("error"):
@@ -854,7 +882,7 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
         "next_cursor": None
     }
 
-    # attach cursor if we still have work (next_frontier not empty and depth not beyond)
+    # attach cursor if more work remains
     if next_frontier and depth_completed < max_depth:
         cursor_state = {
             "root": root,
@@ -872,3 +900,4 @@ async def report_paged(payload: Dict[str, Any] = Body(...)):
     sized["truncated"] = truncated
     sized["approx_bytes"] = _approx_size(**sized)
     return sized
+```
