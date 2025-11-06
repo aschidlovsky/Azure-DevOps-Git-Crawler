@@ -505,14 +505,16 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
 
     # Business-rule signals
     for line_no, line in enumerate(content.splitlines(), start=1):
-        if any(token in line for token in ["validate", "error(", "ttsBegin", "ttsCommit"]):
+        normalized = line.lstrip("#").strip()
+
+        if any(token in normalized for token in ["validate", "error(", "ttsBegin", "ttsCommit"]):
             business.append({"line": line_no, "context": line.strip()[:200]})
 
-        method_match = METHOD_DEF_PATTERN.match(line)
+        method_match = METHOD_DEF_PATTERN.match(normalized)
         if method_match:
             name = method_match.group("name") or ""
             lower = name.lower()
-            info = {"name": name, "line": line_no, "signature": line.strip()[:200]}
+            info = {"name": name, "line": line_no, "signature": normalized[:200]}
             if lower in ENTRY_METHOD_NAMES and lower not in seen_entry:
                 entry_methods.append(info)
                 seen_entry.add(lower)
@@ -520,7 +522,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 crud_methods.append(info)
                 seen_crud.add(lower)
 
-        allow_match = ALLOW_FLAG_PATTERN.search(line)
+        allow_match = ALLOW_FLAG_PATTERN.search(normalized)
         if allow_match:
             flag = {
                 "property": f"Allow{allow_match.group(1)}",
