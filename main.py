@@ -505,7 +505,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
 
     # Business-rule signals
     for line_no, line in enumerate(content.splitlines(), start=1):
-        normalized = line.lstrip("#").strip()
+        normalized = line.lstrip().lstrip("#").strip()
 
         if any(token in normalized for token in ["validate", "error(", "ttsBegin", "ttsCommit"]):
             business.append({"line": line_no, "context": line.strip()[:200]})
