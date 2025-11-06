@@ -517,9 +517,40 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                         }
                     )
 
+    lines = content.splitlines()
+
+    def _method_context(idx: int) -> str:
+        context_name: Optional[str] = None
+        context_type: Optional[str] = None
+        for back in range(idx, -1, -1):
+            stripped = lines[back].strip()
+            if not context_name and stripped.startswith("Name"):
+                parts = stripped.split("#", 1)
+                if len(parts) > 1:
+                    context_name = parts[1].strip()
+            if not context_type:
+                if stripped.startswith("CONTROL "):
+                    tokens = stripped.split()
+                    if len(tokens) >= 2:
+                        context_type = f"CONTROL {tokens[1]}"
+                elif stripped.startswith("DATASOURCE"):
+                    context_type = "DATASOURCE"
+                elif stripped.startswith("FORM "):
+                    context_type = "FORM"
+                elif stripped.startswith("OBJECTPOOL"):
+                    context_type = "OBJECTPOOL"
+            if context_name and context_type:
+                break
+        parts: List[str] = []
+        if context_type:
+            parts.append(context_type)
+        if context_name:
+            parts.append(context_name)
+        return " > ".join(parts) if parts else "FORM"
+
     # Business-rule signals
-    for line_no, line in enumerate(content.splitlines(), start=1):
-        normalized = line.lstrip().lstrip("#").strip()
+    for line_no, raw_line in enumerate(lines, start=1):
+        normalized = raw_line.lstrip("#").strip()
         if not normalized:
             continue
 
@@ -530,7 +561,12 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         if method_match:
             name = method_match.group("name") or ""
             lower = name.lower()
-            info = {"name": name, "line": line_no, "signature": normalized[:200]}
+            info = {
+                "name": name,
+                "line": line_no,
+                "signature": normalized[:200],
+                "context": _method_context(line_no - 1),
+            }
             if lower in ENTRY_METHOD_NAMES and (lower, line_no) not in seen_entry:
                 entry_methods.append(info)
                 seen_entry.add((lower, line_no))
@@ -544,7 +580,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 "property": f"Allow{allow_match.group(1)}",
                 "value": allow_match.group(2).capitalize(),
                 "line": line_no,
-                "context": line.strip()[:200],
+                "context": normalized[:200],
             }
             allow_flags.append(flag)
 
