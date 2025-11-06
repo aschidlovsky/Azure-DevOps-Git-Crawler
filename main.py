@@ -258,6 +258,17 @@ def _apply_size_budget(max_bytes: int, resp: Dict[str, Any], fields_order: List[
     return resp, truncated
 
 
+def _strip_xpo_hash(line: str) -> str:
+    """Remove leading XPO hash markers while preserving indentation as much as reasonable."""
+    if not line:
+        return line
+    # Remove leading whitespace followed by '#', but keep one level of indentation.
+    stripped = line.lstrip()
+    if stripped.startswith("#"):
+        stripped = stripped[1:]
+    return stripped.rstrip("\n")
+
+
 # =========================================
 # HELPERS
 # =========================================
@@ -523,7 +534,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         context_name: Optional[str] = None
         context_type: Optional[str] = None
         for back in range(idx, -1, -1):
-            stripped = lines[back].strip()
+            stripped = _strip_xpo_hash(lines[back]).strip()
             if not context_name and stripped.startswith("Name"):
                 parts = stripped.split("#", 1)
                 if len(parts) > 1:
@@ -548,9 +559,26 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             parts.append(context_name)
         return " > ".join(parts) if parts else "FORM"
 
+    def _capture_method_body(idx: int) -> str:
+        snippet_lines: List[str] = []
+        brace_depth = 0
+        seen_body = False
+        for pointer in range(idx, len(lines)):
+            cleaned = _strip_xpo_hash(lines[pointer])
+            snippet_lines.append(cleaned.rstrip())
+            brace_depth += cleaned.count("{")
+            brace_depth -= cleaned.count("}")
+            if "{" in cleaned:
+                seen_body = True
+            if seen_body and brace_depth <= 0:
+                break
+            if len(snippet_lines) >= 80:
+                break
+        return "\n".join(snippet_lines).strip()
+
     # Business-rule signals
     for line_no, raw_line in enumerate(lines, start=1):
-        normalized = raw_line.lstrip("#").strip()
+        normalized = _strip_xpo_hash(raw_line).strip()
         if not normalized:
             continue
 
@@ -566,6 +594,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 "line": line_no,
                 "signature": normalized[:200],
                 "context": _method_context(line_no - 1),
+                "snippet": _capture_method_body(line_no - 1),
             }
             if lower in ENTRY_METHOD_NAMES and (lower, line_no) not in seen_entry:
                 entry_methods.append(info)
