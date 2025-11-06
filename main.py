@@ -196,7 +196,7 @@ CRUD_METHOD_NAMES = {"insert", "update", "delete", "write", "validatewrite", "va
 METHOD_DEF_PATTERN = re.compile(
     r"^#?\s*(?:\[[^\]]+\]\s*)*"
     r"(?:(?:public|protected|private|static|final|override|client|server|display|editable|edit|internal|external)\s+)*"
-    r"(?:void|boolean|int|real|str|container|date|utcdatetime|anytype|guid|number|variant|time|display)\s+"
+    r"(?P<rtype>[A-Za-z_][A-Za-z0-9_]*)\s+"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.IGNORECASE,
 )
