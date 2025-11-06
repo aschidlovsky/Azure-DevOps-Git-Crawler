@@ -436,10 +436,22 @@
               "$ref": "#/components/schemas/MethodHit"
             }
           },
+          "crud_operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CrudOperation"
+            }
+          },
           "allow_flags": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/AllowFlag"
+            }
+          },
+          "crud_operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CrudOperation"
             }
           },
           "approx_bytes": {
@@ -590,6 +602,12 @@
               "$ref": "#/components/schemas/ImplicitCrud"
             }
           },
+          "crud_operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CrudOperation"
+            }
+          },
           "status": {
             "type": "string",
             "example": "complete"
@@ -645,6 +663,43 @@
           },
           "context": {
             "type": "string"
+          }
+        }
+      },
+      "CrudOperation": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "description": "Operation type such as update_recordset, insert, update, delete"
+          },
+          "target": {
+            "type": "string",
+            "description": "Table or alias targeted by the operation"
+          },
+          "code": {
+            "type": "string",
+            "description": "Exact AX code line containing the operation"
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number within the file"
+          },
+          "method": {
+            "type": "string",
+            "description": "Containing method name"
+          },
+          "method_context": {
+            "type": "string",
+            "description": "Control/datasource/form context for the method"
+          },
+          "method_line": {
+            "type": "integer",
+            "description": "Line number where the method is declared"
+          },
+          "method_snippet": {
+            "type": "string",
+            "description": "Full method body snippet"
           }
         }
       },
