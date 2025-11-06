@@ -194,10 +194,10 @@ ENTRY_METHOD_NAMES = {
 }
 CRUD_METHOD_NAMES = {"insert", "update", "delete", "write", "validatewrite", "validatedelete"}
 METHOD_DEF_PATTERN = re.compile(
-    r"^\s*(?:\[[^\]]+\]\s*)*"
+    r"^#?\s*(?:\[[^\]]+\]\s*)*"
     r"(?:(public|protected|private)\s+)?"
-    r"(?:(static|final|override)\s+)*"
-    r"(void|boolean|int|real|str|container|date|utcdatetime|anytype|guid|number|variant|time)\s+"
+    r"(?:(?:static|final|override)\s+)*"
+    r"(?:void|boolean|int|real|str|container|date|utcdatetime|anytype|guid|number|variant|time)\s+"
     r"(?P<name>[A-Za-z0-9_]+)\s*\(",
     re.IGNORECASE,
 )
@@ -521,9 +521,11 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     # Business-rule signals
     for line_no, line in enumerate(content.splitlines(), start=1):
         normalized = line.lstrip().lstrip("#").strip()
+        if not normalized:
+            continue
 
         if any(token in normalized for token in ["validate", "error(", "ttsBegin", "ttsCommit"]):
-            business.append({"line": line_no, "context": line.strip()[:200]})
+            business.append({"line": line_no, "context": normalized[:200]})
 
         method_match = METHOD_DEF_PATTERN.match(normalized)
         if method_match:
