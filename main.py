@@ -648,6 +648,9 @@ async def deps_get(
         "dependencies": paged,
         "business_rules": parsed["business_rules"],
         "implicit_crud": parsed["implicit_crud"],
+        "entry_methods": parsed["entry_methods"],
+        "crud_methods": parsed["crud_methods"],
+        "allow_flags": parsed["allow_flags"],
         "unresolved": [],
         "visited": [file],
         "skipped": [],
@@ -677,6 +680,9 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
             "dependencies": [],
             "business_rules": [],
             "implicit_crud": [],
+             "entry_methods": [],
+             "crud_methods": [],
+             "allow_flags": [],
             "error": f"deps_get: {exc}",
         }
 
@@ -699,6 +705,9 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
         "dependencies": norm_deps,
         "business_rules": deps_res.get("business_rules", []),
         "implicit_crud": deps_res.get("implicit_crud", []),
+        "entry_methods": deps_res.get("entry_methods", []),
+        "crud_methods": deps_res.get("crud_methods", []),
+        "allow_flags": deps_res.get("allow_flags", []),
         "error": None,
     }
 
