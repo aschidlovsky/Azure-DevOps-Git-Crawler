@@ -176,7 +176,22 @@ CRUD_SIGNATURE = re.compile(
     re.IGNORECASE,
 )
 
-ENTRY_METHOD_NAMES = {"init", "run", "clicked", "write"}
+ENTRY_METHOD_NAMES = {
+    "init",
+    "run",
+    "clicked",
+    "write",
+    "active",
+    "modified",
+    "close",
+    "closeok",
+    "executequery",
+    "lookup",
+    "refresh",
+    "activate",
+    "leave",
+    "enter",
+}
 CRUD_METHOD_NAMES = {"insert", "update", "delete", "write", "validatewrite", "validatedelete"}
 METHOD_DEF_PATTERN = re.compile(
     r"^\s*(?:\[[^\]]+\]\s*)*"
@@ -444,8 +459,8 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     dep_keys: Set[str] = set()
     entry_methods: List[Dict[str, Any]] = []
     crud_methods: List[Dict[str, Any]] = []
-    seen_entry: Set[str] = set()
-    seen_crud: Set[str] = set()
+    seen_entry: Set[Tuple[str, int]] = set()
+    seen_crud: Set[Tuple[str, int]] = set()
     allow_flags: List[Dict[str, Any]] = []
 
     # direct deps
@@ -515,12 +530,12 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             name = method_match.group("name") or ""
             lower = name.lower()
             info = {"name": name, "line": line_no, "signature": normalized[:200]}
-            if lower in ENTRY_METHOD_NAMES and lower not in seen_entry:
+            if lower in ENTRY_METHOD_NAMES and (lower, line_no) not in seen_entry:
                 entry_methods.append(info)
-                seen_entry.add(lower)
-            if lower in CRUD_METHOD_NAMES and lower not in seen_crud:
+                seen_entry.add((lower, line_no))
+            if lower in CRUD_METHOD_NAMES and (lower, line_no) not in seen_crud:
                 crud_methods.append(info)
-                seen_crud.add(lower)
+                seen_crud.add((lower, line_no))
 
         allow_match = ALLOW_FLAG_PATTERN.search(normalized)
         if allow_match:
