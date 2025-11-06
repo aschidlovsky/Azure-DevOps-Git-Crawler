@@ -679,12 +679,136 @@
             "type": "string",
             "description": "Full method body snippet"
           },
+          "body_lines": {
+            "type": "array",
+            "description": "Individual method body lines with source numbers",
+            "items": {
+              "$ref": "#/components/schemas/MethodLine"
+            }
+          },
           "operations": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/CrudOperation"
             },
             "description": "CRUD operations detected within this method"
+          },
+          "calls": {
+            "type": "array",
+            "description": "Function or method invocations inside the body",
+            "items": {
+              "$ref": "#/components/schemas/MethodCall"
+            }
+          },
+          "assignments": {
+            "type": "array",
+            "description": "Assignments performed inside the method",
+            "items": {
+              "$ref": "#/components/schemas/MethodAssignment"
+            }
+          },
+          "conditions": {
+            "type": "array",
+            "description": "Conditional statements encountered inside the method",
+            "items": {
+              "$ref": "#/components/schemas/MethodCondition"
+            }
+          },
+          "returns": {
+            "type": "array",
+            "description": "Return statements within the method body",
+            "items": {
+              "$ref": "#/components/schemas/MethodReturn"
+            }
+          }
+        }
+      },
+      "MethodLine": {
+        "type": "object",
+        "properties": {
+          "line": {
+            "type": "integer",
+            "description": "Line number within the file"
+          },
+          "text": {
+            "type": "string",
+            "description": "Source code for the line"
+          }
+        }
+      },
+      "MethodCall": {
+        "type": "object",
+        "properties": {
+          "call": {
+            "type": "string",
+            "description": "Called function or method identifier"
+          },
+          "call_type": {
+            "type": "string",
+            "description": "static, instance, or local"
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number of the call"
+          },
+          "code": {
+            "type": "string",
+            "description": "Full source line containing the call"
+          }
+        }
+      },
+      "MethodAssignment": {
+        "type": "object",
+        "properties": {
+          "left": {
+            "type": "string",
+            "description": "Assignment target"
+          },
+          "right": {
+            "type": "string",
+            "description": "Assigned value/expression"
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number of the assignment"
+          },
+          "code": {
+            "type": "string",
+            "description": "Full source line for the assignment"
+          }
+        }
+      },
+      "MethodCondition": {
+        "type": "object",
+        "properties": {
+          "condition": {
+            "type": "string",
+            "description": "Conditional expression text"
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number of the condition"
+          },
+          "code": {
+            "type": "string",
+            "description": "Full source line of the conditional statement"
+          }
+        }
+      },
+      "MethodReturn": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "string",
+            "description": "Return expression (empty if none)"
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number of the return statement"
+          },
+          "code": {
+            "type": "string",
+            "description": "Full source line of the return statement"
           }
         }
       },
@@ -752,6 +876,49 @@
           "control_type": {
             "type": "string",
             "description": "Control type (Button, CheckBox, etc.)"
+          },
+          "hierarchy": {
+            "type": "string",
+            "nullable": true,
+            "description": "Hierarchy path (parent controls) for this control"
+          },
+          "start_line": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Line number where the control starts"
+          },
+          "end_line": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Line number where the control ends"
+          },
+          "properties": {
+            "type": "array",
+            "description": "Key properties pulled from the control block",
+            "items": {
+              "$ref": "#/components/schemas/UIControlProperty"
+            }
+          },
+          "snippet": {
+            "type": "string",
+            "description": "Raw control block snippet (truncated)"
+          }
+        }
+      },
+      "UIControlProperty": {
+        "type": "object",
+        "properties": {
+          "property": {
+            "type": "string",
+            "description": "Property name within the control block"
+          },
+          "value": {
+            "type": "string",
+            "description": "Property value"
+          },
+          "line": {
+            "type": "integer",
+            "description": "Source line number for the property"
           }
         }
       },
@@ -783,6 +950,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/CrudOperation"
+            }
+          },
+          "ui_controls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UIControl"
             }
           }
         }

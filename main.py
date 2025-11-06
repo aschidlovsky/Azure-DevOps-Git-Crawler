@@ -19,7 +19,7 @@ from starlette.responses import JSONResponse
 # APP INIT
 # =========================================
 
-app = FastAPI(title="ADO Repo Dependency Connector", version="1.3.2")
+app = FastAPI(title="ADO Repo Dependency Connector", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -199,6 +199,27 @@ METHOD_DEF_PATTERN = re.compile(
     r"(?P<rtype>[A-Za-z_][A-Za-z0-9_]*)\s+"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.IGNORECASE,
+)
+CALL_KEYWORDS = {
+    "if",
+    "while",
+    "for",
+    "switch",
+    "case",
+    "else",
+    "catch",
+    "try",
+    "ttsbegin",
+    "ttscommit",
+    "return",
+    "break",
+    "continue",
+}
+CALL_PATTERN = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)?(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\("
+)
+CONTROL_PROPERTY_PATTERN = re.compile(
+    r"^(?P<prop>[A-Za-z_][A-Za-z0-9_]*)\s*(?:[:=]|#)\s*(?P<value>.+)$"
 )
 ALLOW_FLAG_PATTERN = re.compile(
     r"\bAllow(Create|Edit|Delete)\b\s*[:=]\s*(Yes|No)",
@@ -476,8 +497,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     seen_crud: Set[Tuple[str, int]] = set()
     allow_flags: List[Dict[str, Any]] = []
     ui_controls: List[Dict[str, Any]] = []
-    control_stack: List[Dict[str, str]] = []
-    name_stack: List[Dict[str, str]] = []
+    control_stack: List[Dict[str, Any]] = []
 
     # direct deps
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
@@ -565,13 +585,15 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             parts.append(context_name)
         return " > ".join(parts) if parts else "FORM"
 
-    def _capture_method_body(idx: int) -> str:
+    def _capture_method_body(idx: int) -> Tuple[str, List[Dict[str, Any]]]:
         snippet_lines: List[str] = []
+        detail_lines: List[Dict[str, Any]] = []
         brace_depth = 0
         seen_body = False
         for pointer in range(idx, len(lines)):
-            cleaned = _strip_xpo_hash(lines[pointer])
-            snippet_lines.append(cleaned.rstrip())
+            cleaned = _strip_xpo_hash(lines[pointer]).rstrip()
+            snippet_lines.append(cleaned)
+            detail_lines.append({"line": pointer + 1, "text": cleaned})
             brace_depth += cleaned.count("{")
             brace_depth -= cleaned.count("}")
             if "{" in cleaned:
@@ -580,18 +602,19 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 break
             if len(snippet_lines) >= 80:
                 break
-        return "\n".join(snippet_lines).strip()
+        snippet_text = "\n".join(snippet_lines).strip()
+        filtered_lines = [entry for entry in detail_lines if (entry.get("text") or "").strip()]
+        return snippet_text, filtered_lines
 
-    def _extract_method_operations(method_info: Dict[str, Any]) -> List[Dict[str, Any]]:
-        snippet_text = method_info.get("snippet") or ""
-        if not snippet_text:
+    def _extract_method_operations(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not body_lines:
             return []
         operations: List[Dict[str, Any]] = []
-        base_line = method_info.get("line", 0)
-        for offset, snippet_line in enumerate(snippet_text.splitlines(), start=0):
-            stripped_line = snippet_line.strip()
+        for entry in body_lines:
+            stripped_line = (entry.get("text") or "").strip()
             if not stripped_line:
                 continue
+            actual_line = entry.get("line")
             match = re.search(r"\bupdate_recordset\s+([A-Za-z_][A-Za-z0-9_]*)", stripped_line, re.IGNORECASE)
             if match:
                 operations.append(
@@ -599,7 +622,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                         "operation": "update_recordset",
                         "target": match.group(1),
                         "code": stripped_line,
-                        "line": base_line + offset,
+                        "line": actual_line,
                     }
                 )
             match = re.search(r"\binsert_recordset\s+([A-Za-z_][A-Za-z0-9_]*)", stripped_line, re.IGNORECASE)
@@ -609,7 +632,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                         "operation": "insert_recordset",
                         "target": match.group(1),
                         "code": stripped_line,
-                        "line": base_line + offset,
+                        "line": actual_line,
                     }
                 )
             match = re.search(r"\bdelete_from\s+([A-Za-z_][A-Za-z0-9_]*)", stripped_line, re.IGNORECASE)
@@ -619,7 +642,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                         "operation": "delete_from",
                         "target": match.group(1),
                         "code": stripped_line,
-                        "line": base_line + offset,
+                        "line": actual_line,
                     }
                 )
             match = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\.(insert|update|delete)\s*\(", stripped_line, re.IGNORECASE)
@@ -629,36 +652,176 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                         "operation": match.group(2).lower(),
                         "target": match.group(1),
                         "code": stripped_line,
-                        "line": base_line + offset,
+                        "line": actual_line,
                     }
                 )
         return operations
     
-    # UI controls stack
-    for line in lines:
-        stripped = _strip_xpo_hash(line).strip()
-        if not stripped:
-            continue
-        match_control = UI_CONTROL_PATTERN.match(stripped)
-        if match_control:
-            control_type = match_control.group(1)
-            control_stack.append(control_type)
-            continue
-        if stripped.startswith("ENDCONTROL") and control_stack:
-            control_stack.pop()
-            if name_stack:
-                name_stack.pop()
-            continue
-        match_name = NAME_PROPERTY_PATTERN.match(stripped)
-        if match_name and control_stack:
-            control_name = match_name.group(1).strip()
-            ui_controls.append(
+    def _extract_method_calls(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        calls: List[Dict[str, Any]] = []
+        seen: Set[Tuple[int, str]] = set()
+        for entry in body_lines:
+            text = (entry.get("text") or "").strip()
+            if not text:
+                continue
+            for match in CALL_PATTERN.finditer(text):
+                target = match.group(1)
+                if not target:
+                    continue
+                normalized = target.lower()
+                if normalized in CALL_KEYWORDS:
+                    continue
+                key = (entry.get("line") or 0, target)
+                if key in seen:
+                    continue
+                seen.add(key)
+                call_type = "static" if "::" in target else ("instance" if "." in target else "local")
+                calls.append(
+                    {
+                        "call": target,
+                        "call_type": call_type,
+                        "line": entry.get("line"),
+                        "code": text,
+                    }
+                )
+        return calls
+
+    def _extract_method_assignments(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        assignments: List[Dict[str, Any]] = []
+        for entry in body_lines:
+            text = (entry.get("text") or "").strip()
+            if not text or "=" not in text:
+                continue
+            if "==" in text or "<=" in text or ">=" in text or "!=" in text:
+                continue
+            left, right = text.split("=", 1)
+            left = left.strip()
+            right = right.strip().rstrip(";")
+            if not left or left.lower() in {"select"}:
+                continue
+            assignments.append(
                 {
-                    "name": control_name,
-                    "control_type": control_stack[-1],
+                    "left": left,
+                    "right": right,
+                    "line": entry.get("line"),
+                    "code": text,
                 }
             )
-            name_stack.append(control_name)
+        return assignments
+
+    def _extract_method_conditions(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        conditions: List[Dict[str, Any]] = []
+        for entry in body_lines:
+            text = (entry.get("text") or "").strip()
+            if not text:
+                continue
+            lower = text.lower()
+            if lower.startswith(("if ", "if(", "while ", "while(", "switch", "for ", "for(")):
+                conditions.append(
+                    {
+                        "condition": text,
+                        "line": entry.get("line"),
+                        "code": text,
+                    }
+                )
+        return conditions
+
+    def _extract_method_returns(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        returns: List[Dict[str, Any]] = []
+        for entry in body_lines:
+            text = (entry.get("text") or "").strip()
+            if not text:
+                continue
+            lower = text.lower()
+            if lower.startswith("return"):
+                value = text[6:].strip().rstrip(";")
+                returns.append(
+                    {
+                        "value": value,
+                        "line": entry.get("line"),
+                        "code": text,
+                    }
+                )
+        return returns
+    
+    def _finalize_control(ctrl: Dict[str, Any], ancestors: List[Dict[str, Any]], end_line: int) -> None:
+        ctrl["end_line"] = end_line
+        lines_in_block: List[Dict[str, Any]] = ctrl.get("lines", [])
+        properties: List[Dict[str, Any]] = []
+        for entry in lines_in_block:
+            text = (entry.get("text") or "").strip()
+            if not text or text.upper().startswith(("CONTROL", "ENDCONTROL", "METHOD", "PROPERTIES")):
+                continue
+            prop_match = CONTROL_PROPERTY_PATTERN.match(text)
+            if prop_match:
+                prop_name = prop_match.group("prop")
+                if prop_name.lower() == "name":
+                    continue
+                value = prop_match.group("value").rstrip(";")
+                properties.append(
+                    {
+                        "property": prop_name,
+                        "value": value.strip(),
+                        "line": entry.get("line"),
+                    }
+                )
+        hierarchy_parts: List[str] = []
+        for ancestor in ancestors:
+            ancestor_name = ancestor.get("name") or f"{ancestor.get('control_type')}@{ancestor.get('start_line')}"
+            hierarchy_parts.append(ancestor_name)
+        current_name = ctrl.get("name") or f"{ctrl.get('control_type')}@{ctrl.get('start_line')}"
+        hierarchy_parts.append(current_name)
+        snippet = "\n".join(
+            entry.get("text", "")
+            for entry in lines_in_block
+            if entry.get("text", "").strip()
+        )
+        if len(snippet) > 6000:
+            snippet = snippet[:6000]
+        ui_controls.append(
+            {
+                "name": ctrl.get("name") or current_name,
+                "control_type": ctrl.get("control_type"),
+                "hierarchy": " > ".join(hierarchy_parts) if hierarchy_parts else None,
+                "start_line": ctrl.get("start_line"),
+                "end_line": ctrl.get("end_line"),
+                "properties": properties,
+                "snippet": snippet,
+            }
+        )
+
+    # UI controls stack
+    for line_no, raw_line in enumerate(lines, start=1):
+        cleaned_line = _strip_xpo_hash(raw_line).rstrip()
+        stripped = cleaned_line.strip()
+        match_control = UI_CONTROL_PATTERN.match(stripped)
+        if match_control:
+            control_stack.append(
+                {
+                    "control_type": match_control.group(1),
+                    "start_line": line_no,
+                    "lines": [{"line": line_no, "text": cleaned_line}],
+                    "name": None,
+                }
+            )
+            continue
+
+        if control_stack:
+            control_stack[-1]["lines"].append({"line": line_no, "text": cleaned_line})
+
+        match_name = NAME_PROPERTY_PATTERN.match(stripped)
+        if match_name and control_stack:
+            control_stack[-1]["name"] = match_name.group(1).strip()
+            continue
+
+        if stripped.upper().startswith("ENDCONTROL") and control_stack:
+            current = control_stack.pop()
+            _finalize_control(current, control_stack, line_no)
+
+    while control_stack:
+        current = control_stack.pop()
+        end_line = current.get("lines", [{}])[-1].get("line", len(lines))
+        _finalize_control(current, control_stack, end_line)
 
     # Business-rule signals
     for line_no, raw_line in enumerate(lines, start=1):
@@ -673,14 +836,20 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         if method_match:
             name = method_match.group("name") or ""
             lower = name.lower()
+            snippet_text, body_lines = _capture_method_body(line_no - 1)
             info = {
                 "name": name,
                 "line": line_no,
                 "signature": normalized[:200],
                 "context": _method_context(line_no - 1),
-                "snippet": _capture_method_body(line_no - 1),
+                "snippet": snippet_text,
+                "body_lines": body_lines,
             }
-            info["operations"] = _extract_method_operations(info)
+            info["operations"] = _extract_method_operations(body_lines)
+            info["calls"] = _extract_method_calls(body_lines)
+            info["assignments"] = _extract_method_assignments(body_lines)
+            info["conditions"] = _extract_method_conditions(body_lines)
+            info["returns"] = _extract_method_returns(body_lines)
             if lower in ENTRY_METHOD_NAMES and (lower, line_no) not in seen_entry:
                 entry_methods.append(info)
                 seen_entry.add((lower, line_no))

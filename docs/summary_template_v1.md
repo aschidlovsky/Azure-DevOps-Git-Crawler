@@ -1,9 +1,9 @@
-# Summary Template (Version 1.0)
+# Summary Template (Version 1.1)
 
 > Always mirror this template exactly. Replace the bracketed tokens with real values and delete the brackets. Keep section titles, indentation, bullet styles, and ordering unchanged. If a section has no content, include the header and note `None`.
 
 ```
-Summary Template v1.0
+Summary Template v1.1
 
 Entry File
 - Path: <path>
@@ -21,6 +21,9 @@ Entry Points & Triggers
      <AX code excerpt>
      ```
    - Explanation: <describe exactly what the snippet does>
+   - Key statements:
+     - Line <line> — `<code>` → <explain the invoked call, assignment, or condition and the data it touches>
+     - <Repeat for every critical statement captured in calls/assignments/conditions>
 2. <Repeat for every method>
 
 UI Highlights
@@ -32,6 +35,9 @@ UI Highlights
     <binding or handler code>
     ```
   - Explanation: <how the UI requirement is satisfied>
+  - Key bindings:
+    - Line <line> — `<property = value>` → <explain how this property drives the UI/data>
+    - <Repeat for each relevant property>
 ... (one bullet per control)
 - Datasource: <Name> — <brief UI role> (list each datasource not already covered)
 
@@ -51,6 +57,9 @@ Functional Requirements
      <AX code excerpt>
      ```
    - Explanation: <how the snippet enforces the requirement>
+   - Implementation detail:
+     - Line <line> — `<code>` → <describe the exact call/assignment/condition enforcing the requirement>
+     - <Add additional lines as needed>
 2. <Repeat for every requirement>
 
 Functional Deep Dive
