@@ -205,6 +205,9 @@ ALLOW_FLAG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+UI_CONTROL_PATTERN = re.compile(r"^CONTROL\s+([A-Za-z]+)\s*$", re.IGNORECASE)
+NAME_PROPERTY_PATTERN = re.compile(r"^\s*Name\s*#(.+)$")
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
@@ -472,6 +475,9 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     seen_entry: Set[Tuple[str, int]] = set()
     seen_crud: Set[Tuple[str, int]] = set()
     allow_flags: List[Dict[str, Any]] = []
+    ui_controls: List[Dict[str, Any]] = []
+    control_stack: List[Dict[str, str]] = []
+    name_stack: List[Dict[str, str]] = []
 
     # direct deps
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
@@ -627,6 +633,32 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                     }
                 )
         return operations
+    
+    # UI controls stack
+    for line in lines:
+        stripped = _strip_xpo_hash(line).strip()
+        if not stripped:
+            continue
+        match_control = UI_CONTROL_PATTERN.match(stripped)
+        if match_control:
+            control_type = match_control.group(1)
+            control_stack.append(control_type)
+            continue
+        if stripped.startswith("ENDCONTROL") and control_stack:
+            control_stack.pop()
+            if name_stack:
+                name_stack.pop()
+            continue
+        match_name = NAME_PROPERTY_PATTERN.match(stripped)
+        if match_name and control_stack:
+            control_name = match_name.group(1).strip()
+            ui_controls.append(
+                {
+                    "name": control_name,
+                    "control_type": control_stack[-1],
+                }
+            )
+            name_stack.append(control_name)
 
     # Business-rule signals
     for line_no, raw_line in enumerate(lines, start=1):
@@ -696,6 +728,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         "crud_methods": crud_methods,
         "allow_flags": allow_flags,
         "crud_operations": crud_operations,
+        "ui_controls": ui_controls,
     }
 
 
@@ -834,6 +867,7 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
             "crud_methods": [],
             "allow_flags": [],
             "crud_operations": [],
+            "ui_controls": [],
             "error": f"deps_get: {exc}",
         }
 
@@ -860,6 +894,7 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
         "crud_methods": deps_res.get("crud_methods", []),
         "allow_flags": deps_res.get("allow_flags", []),
         "crud_operations": deps_res.get("crud_operations", []),
+        "ui_controls": deps_res.get("ui_controls", []),
         "error": None,
     }
 
@@ -881,6 +916,8 @@ async def _collect_branch(
     visit_order: List[str] = []
     overflow: List[str] = []
     method_summary: List[Dict[str, Any]] = []
+    crud_operations_all: List[Dict[str, Any]] = []
+    ui_controls_all: List[Dict[str, Any]] = []
 
     async def _analyze_guarded(path: str) -> Dict[str, Any]:
         if path in analysis_cache:
@@ -938,7 +975,6 @@ async def _collect_branch(
     business_rules: List[Dict[str, Any]] = []
     implicit_crud: List[Dict[str, Any]] = []
     objects: List[Dict[str, Any]] = []
-    crud_operations_all: List[Dict[str, Any]] = []
     seen_edges: Set[Tuple[str, str, Optional[str]]] = set()
 
     for path in visit_order:
@@ -948,6 +984,7 @@ async def _collect_branch(
         crud_methods = analysis.get("crud_methods", [])
         allow_flags = analysis.get("allow_flags", [])
         crud_operations = analysis.get("crud_operations", [])
+        ui_controls = analysis.get("ui_controls", [])
         method_summary.append(
             {
                 "path": path,
@@ -955,6 +992,7 @@ async def _collect_branch(
                 "crud_methods": crud_methods,
                 "allow_flags": allow_flags,
                 "crud_operations": crud_operations,
+                "ui_controls": ui_controls,
             }
         )
         objects.append(
@@ -968,12 +1006,14 @@ async def _collect_branch(
                 "crud_methods": crud_methods,
                 "allow_flags": allow_flags,
                 "crud_operations": crud_operations,
+                "ui_controls": ui_controls,
             }
         )
 
         business_rules.extend(analysis.get("business_rules", []) or [])
         implicit_crud.extend(analysis.get("implicit_crud", []) or [])
         crud_operations_all.extend(crud_operations or [])
+        ui_controls_all.extend(ui_controls or [])
 
         if analysis.get("error"):
             graph.append({"file": path, "depth": depth_idx, "dependencies": [], "error": analysis["error"]})
@@ -1021,6 +1061,7 @@ async def _collect_branch(
         "status": status,
         "method_summary": method_summary,
         "crud_operations": crud_operations_all,
+        "ui_controls": ui_controls_all,
     }
 
 
@@ -1069,6 +1110,7 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
         "crud_methods": analysis.get("crud_methods", []),
         "allow_flags": analysis.get("allow_flags", []),
         "crud_operations": analysis.get("crud_operations", []),
+        "ui_controls": analysis.get("ui_controls", []),
     }
     response["approx_bytes"] = _approx_size(response)
     log.info(
@@ -1126,7 +1168,7 @@ async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     trimmed, truncated = _apply_size_budget(
         max_bytes,
         branch,
-        ["edges", "objects", "business_rules", "implicit_crud", "graph", "method_summary", "crud_operations"],
+        ["edges", "objects", "business_rules", "implicit_crud", "graph", "method_summary", "crud_operations", "ui_controls"],
     )
     trimmed["truncated"] = truncated
     trimmed["approx_bytes"] = _approx_size(trimmed)

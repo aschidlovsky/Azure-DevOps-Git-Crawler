@@ -454,6 +454,12 @@
               "$ref": "#/components/schemas/CrudOperation"
             }
           },
+          "ui_controls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UIControl"
+            }
+          },
           "approx_bytes": {
             "type": "integer"
           }
@@ -515,6 +521,18 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/AllowFlag"
+            }
+          },
+          "crud_operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CrudOperation"
+            }
+          },
+          "ui_controls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UIControl"
             }
           }
         }
@@ -606,6 +624,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/CrudOperation"
+            }
+          },
+          "ui_controls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UIControl"
             }
           },
           "status": {
@@ -715,6 +739,19 @@
           "method_snippet": {
             "type": "string",
             "description": "Full method body snippet"
+          }
+        }
+      },
+      "UIControl": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Control name as declared in the form"
+          },
+          "control_type": {
+            "type": "string",
+            "description": "Control type (Button, CheckBox, etc.)"
           }
         }
       },
