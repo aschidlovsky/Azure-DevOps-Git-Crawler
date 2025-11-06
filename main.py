@@ -576,6 +576,58 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 break
         return "\n".join(snippet_lines).strip()
 
+    def _extract_method_operations(method_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+        snippet_text = method_info.get("snippet") or ""
+        if not snippet_text:
+            return []
+        operations: List[Dict[str, Any]] = []
+        base_line = method_info.get("line", 0)
+        for offset, snippet_line in enumerate(snippet_text.splitlines(), start=0):
+            stripped_line = snippet_line.strip()
+            if not stripped_line:
+                continue
+            match = re.search(r"\bupdate_recordset\s+([A-Za-z_][A-Za-z0-9_]*)", stripped_line, re.IGNORECASE)
+            if match:
+                operations.append(
+                    {
+                        "operation": "update_recordset",
+                        "target": match.group(1),
+                        "code": stripped_line,
+                        "line": base_line + offset,
+                    }
+                )
+            match = re.search(r"\binsert_recordset\s+([A-Za-z_][A-Za-z0-9_]*)", stripped_line, re.IGNORECASE)
+            if match:
+                operations.append(
+                    {
+                        "operation": "insert_recordset",
+                        "target": match.group(1),
+                        "code": stripped_line,
+                        "line": base_line + offset,
+                    }
+                )
+            match = re.search(r"\bdelete_from\s+([A-Za-z_][A-Za-z0-9_]*)", stripped_line, re.IGNORECASE)
+            if match:
+                operations.append(
+                    {
+                        "operation": "delete_from",
+                        "target": match.group(1),
+                        "code": stripped_line,
+                        "line": base_line + offset,
+                    }
+                )
+            match = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\.(insert|update|delete)\s*\(", stripped_line, re.IGNORECASE)
+            if match:
+                operations.append(
+                    {
+                        "operation": match.group(2).lower(),
+                        "target": match.group(1),
+                        "code": stripped_line,
+                        "line": base_line + offset,
+                    }
+                )
+        return operations
+
     # Business-rule signals
     for line_no, raw_line in enumerate(lines, start=1):
         normalized = _strip_xpo_hash(raw_line).strip()
@@ -596,6 +648,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
                 "context": _method_context(line_no - 1),
                 "snippet": _capture_method_body(line_no - 1),
             }
+            info["operations"] = _extract_method_operations(info)
             if lower in ENTRY_METHOD_NAMES and (lower, line_no) not in seen_entry:
                 entry_methods.append(info)
                 seen_entry.add((lower, line_no))
@@ -613,6 +666,20 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             }
             allow_flags.append(flag)
 
+    crud_operations: List[Dict[str, Any]] = []
+    for method in entry_methods + crud_methods:
+        for operation in method.get("operations") or []:
+            enriched = dict(operation)
+            enriched.update(
+                {
+                    "method": method.get("name"),
+                    "method_context": method.get("context"),
+                    "method_line": method.get("line"),
+                    "method_snippet": method.get("snippet"),
+                }
+            )
+            crud_operations.append(enriched)
+
     log.info(
         "[extract] file=%s deps=%d ds=%d crud=%d rules=%d",
         file_path or "<mem>",
@@ -628,6 +695,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         "entry_methods": entry_methods,
         "crud_methods": crud_methods,
         "allow_flags": allow_flags,
+        "crud_operations": crud_operations,
     }
 
 
@@ -732,6 +800,7 @@ async def deps_get(
         "entry_methods": parsed["entry_methods"],
         "crud_methods": parsed["crud_methods"],
         "allow_flags": parsed["allow_flags"],
+        "crud_operations": parsed["crud_operations"],
         "unresolved": [],
         "visited": [file],
         "skipped": [],
@@ -761,9 +830,10 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
             "dependencies": [],
             "business_rules": [],
             "implicit_crud": [],
-             "entry_methods": [],
-             "crud_methods": [],
-             "allow_flags": [],
+            "entry_methods": [],
+            "crud_methods": [],
+            "allow_flags": [],
+            "crud_operations": [],
             "error": f"deps_get: {exc}",
         }
 
@@ -789,6 +859,7 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
         "entry_methods": deps_res.get("entry_methods", []),
         "crud_methods": deps_res.get("crud_methods", []),
         "allow_flags": deps_res.get("allow_flags", []),
+        "crud_operations": deps_res.get("crud_operations", []),
         "error": None,
     }
 
@@ -867,6 +938,7 @@ async def _collect_branch(
     business_rules: List[Dict[str, Any]] = []
     implicit_crud: List[Dict[str, Any]] = []
     objects: List[Dict[str, Any]] = []
+    crud_operations_all: List[Dict[str, Any]] = []
     seen_edges: Set[Tuple[str, str, Optional[str]]] = set()
 
     for path in visit_order:
@@ -875,12 +947,14 @@ async def _collect_branch(
         entry_methods = analysis.get("entry_methods", [])
         crud_methods = analysis.get("crud_methods", [])
         allow_flags = analysis.get("allow_flags", [])
+        crud_operations = analysis.get("crud_operations", [])
         method_summary.append(
             {
                 "path": path,
                 "entry_methods": entry_methods,
                 "crud_methods": crud_methods,
                 "allow_flags": allow_flags,
+                "crud_operations": crud_operations,
             }
         )
         objects.append(
@@ -893,11 +967,13 @@ async def _collect_branch(
                 "entry_methods": entry_methods,
                 "crud_methods": crud_methods,
                 "allow_flags": allow_flags,
+                "crud_operations": crud_operations,
             }
         )
 
         business_rules.extend(analysis.get("business_rules", []) or [])
         implicit_crud.extend(analysis.get("implicit_crud", []) or [])
+        crud_operations_all.extend(crud_operations or [])
 
         if analysis.get("error"):
             graph.append({"file": path, "depth": depth_idx, "dependencies": [], "error": analysis["error"]})
@@ -944,6 +1020,7 @@ async def _collect_branch(
         "implicit_crud": implicit_crud,
         "status": status,
         "method_summary": method_summary,
+        "crud_operations": crud_operations_all,
     }
 
 
@@ -991,6 +1068,7 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
         "entry_methods": analysis.get("entry_methods", []),
         "crud_methods": analysis.get("crud_methods", []),
         "allow_flags": analysis.get("allow_flags", []),
+        "crud_operations": analysis.get("crud_operations", []),
     }
     response["approx_bytes"] = _approx_size(response)
     log.info(
@@ -1048,7 +1126,7 @@ async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     trimmed, truncated = _apply_size_budget(
         max_bytes,
         branch,
-        ["edges", "objects", "business_rules", "implicit_crud", "graph", "method_summary"],
+        ["edges", "objects", "business_rules", "implicit_crud", "graph", "method_summary", "crud_operations"],
     )
     trimmed["truncated"] = truncated
     trimmed["approx_bytes"] = _approx_size(trimmed)
