@@ -179,7 +179,9 @@ CRUD_SIGNATURE = re.compile(
 ENTRY_METHOD_NAMES = {"init", "run", "clicked", "write"}
 CRUD_METHOD_NAMES = {"insert", "update", "delete", "write", "validatewrite", "validatedelete"}
 METHOD_DEF_PATTERN = re.compile(
-    r"^\s*(public|protected|private)?\s+(static\s+)?(final\s+)?"
+    r"^\s*(?:\[[^\]]+\]\s*)*"
+    r"(?:(public|protected|private)\s+)?"
+    r"(?:(static|final|override)\s+)*"
     r"(void|boolean|int|real|str|container|date|utcdatetime|anytype|guid|number|variant|time)\s+"
     r"(?P<name>[A-Za-z0-9_]+)\s*\(",
     re.IGNORECASE,
