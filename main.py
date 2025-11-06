@@ -195,10 +195,9 @@ ENTRY_METHOD_NAMES = {
 CRUD_METHOD_NAMES = {"insert", "update", "delete", "write", "validatewrite", "validatedelete"}
 METHOD_DEF_PATTERN = re.compile(
     r"^#?\s*(?:\[[^\]]+\]\s*)*"
-    r"(?:(public|protected|private)\s+)?"
-    r"(?:(?:static|final|override)\s+)*"
-    r"(?:void|boolean|int|real|str|container|date|utcdatetime|anytype|guid|number|variant|time)\s+"
-    r"(?P<name>[A-Za-z0-9_]+)\s*\(",
+    r"(?:(?:public|protected|private|static|final|override|client|server|display|editable|edit|internal|external)\s+)*"
+    r"(?P<rtype>[A-Za-z_][A-Za-z0-9_]*)\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.IGNORECASE,
 )
 ALLOW_FLAG_PATTERN = re.compile(
