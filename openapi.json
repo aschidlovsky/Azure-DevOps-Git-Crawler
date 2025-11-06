@@ -646,6 +646,21 @@
           },
           "signature": {
             "type": "string"
+          },
+          "context": {
+            "type": "string",
+            "description": "Control/datasource/form context for this method"
+          },
+          "snippet": {
+            "type": "string",
+            "description": "Full method body snippet"
+          },
+          "operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CrudOperation"
+            },
+            "description": "CRUD operations detected within this method"
           }
         }
       },
@@ -725,6 +740,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/AllowFlag"
+            }
+          },
+          "crud_operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CrudOperation"
             }
           }
         }
