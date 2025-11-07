@@ -1485,7 +1485,8 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
 
-    include_source = bool(payload.get("include_source", False))
+    include_source_raw = payload.get("include_source")
+    include_source = True if include_source_raw is None else bool(include_source_raw)
 
     analysis = await _analyze_single_file(start_file, used_ref, return_content=include_source)
     status = "ok" if not analysis.get("error") else "error"

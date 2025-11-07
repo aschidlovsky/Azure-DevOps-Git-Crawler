@@ -14,13 +14,13 @@ Deliver a dependable blueprint for re-implementing AX/D365 .xpo assets in C#. Al
 
 ## Workflow – `/report.firsthop`
 
-Request body: `{ "start_file": "<ENTRY_FILE>", "ref": "<BRANCH>", "include_source": false }`
+Request body: `{ "start_file": "<ENTRY_FILE>", "ref": "<BRANCH>", "include_source": true }`
 
 Collect and report (all drawn directly from API fields):
 - Purpose + metadata of the entry file.
 - Legitimate dependencies (noise filtered) plus `dependency_summary` (custom vs. standard vs. filtered).
 - `entry_methods`, `crud_methods`, `allow_flags`, `implicit_crud`, `crud_operations`, `ui_controls`, `field_usage`, `data_dictionary`, `filtered_dependencies`.
-- Set `"include_source": true` whenever the summary must quote the raw AX code. The response will add a `source` object containing the full file body (subject to size limits).
+- The API includes the raw AX file by default. Only set `"include_source": false` if you explicitly need to omit it. The response’s `source` object contains the full file body (subject to size limits) and must be cited throughout the summary.
 - Branch plan (dependency list marked Planned / Skipped-with-reason / Needs-info).
 
 ## Functional Requirements Sections
