@@ -523,16 +523,22 @@
               "$ref": "#/components/schemas/AllowFlag"
             }
           },
-          "crud_operations": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CrudOperation"
-            }
-          },
           "ui_controls": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/UIControl"
+            }
+          },
+          "field_usage": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldUsageEntry"
+            }
+          },
+          "filtered_dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FilteredDependency"
             }
           }
         }
@@ -655,6 +661,27 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/MethodSummary"
+            }
+          },
+          "field_usage": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldUsageEntry"
+            }
+          },
+          "filtered_dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FilteredDependency"
+            }
+          },
+          "dependency_summary": {
+            "$ref": "#/components/schemas/DependencySummary"
+          },
+          "data_dictionary": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TableFieldDetail"
             }
           }
         }
@@ -922,6 +949,113 @@
           }
         }
       },
+      "FieldUsageEntry": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "occurrences": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldOccurrence"
+            }
+          }
+        }
+      },
+      "FieldOccurrence": {
+        "type": "object",
+        "properties": {
+          "line": {
+            "type": "integer"
+          },
+          "code": {
+            "type": "string"
+          }
+        }
+      },
+      "FilteredDependency": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "DependencySummary": {
+        "type": "object",
+        "properties": {
+          "custom": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DependencySummaryItem"
+            }
+          },
+          "standard": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DependencySummaryItem"
+            }
+          },
+          "filtered": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FilteredDependency"
+            }
+          }
+        }
+      },
+      "DependencySummaryItem": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "TableFieldDetail": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TableFieldEntry"
+            }
+          }
+        }
+      },
+      "TableFieldEntry": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "occurrences": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldOccurrence"
+            }
+          }
+        }
+      },
       "MethodSummary": {
         "type": "object",
         "properties": {
@@ -956,6 +1090,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/UIControl"
+            }
+          },
+          "field_usage": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldUsageEntry"
             }
           }
         }

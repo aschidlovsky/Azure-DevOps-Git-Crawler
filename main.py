@@ -200,6 +200,7 @@ METHOD_DEF_PATTERN = re.compile(
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.IGNORECASE,
 )
+FIELD_REF_PATTERN = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b")
 CALL_KEYWORDS = {
     "if",
     "while",
@@ -229,11 +230,118 @@ ALLOW_FLAG_PATTERN = re.compile(
 UI_CONTROL_PATTERN = re.compile(r"^CONTROL\s+([A-Za-z]+)\s*$", re.IGNORECASE)
 NAME_PROPERTY_PATTERN = re.compile(r"^\s*Name\s*#(.+)$")
 
+CUSTOM_PREFIXES = {"mss", "wb", "zx", "axm"}
+STANDARD_OBJECTS_BASE = {
+    "purchtable",
+    "purchline",
+    "purchparmline",
+    "purchparmtable",
+    "purchreqtable",
+    "purchreqline",
+    "salestable",
+    "salesline",
+    "salesparmtable",
+    "salesparmline",
+    "inventtable",
+    "inventtrans",
+    "inventsum",
+    "inventdim",
+    "inventserial",
+    "inventbatch",
+    "vendtable",
+    "custtable",
+    "dirpartytable",
+    "logisticspostaladdress",
+    "taxtable",
+    "markuptable",
+    "ledgerjournaltrans",
+    "ledgerjournaltable",
+    "projtable",
+    "projsalesprice",
+    "projbudgetline",
+}
+_EXTRA_STANDARD = {
+    symbol.strip().lower()
+    for symbol in os.getenv("STANDARD_OBJECTS_EXTRA", "").split(",")
+    if symbol.strip()
+}
+STANDARD_OBJECTS = STANDARD_OBJECTS_BASE.union(_EXTRA_STANDARD)
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
     except Exception:
         return default
+
+
+def _symbol_category(symbol: Optional[str]) -> str:
+    if not symbol:
+        return "unknown"
+    lowered = symbol.lower()
+    if lowered in STANDARD_OBJECTS:
+        return "standard"
+    for prefix in CUSTOM_PREFIXES:
+        if lowered.startswith(prefix):
+            return "custom"
+    return "custom"
+
+
+def _merge_field_usage(entries: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    if not entries:
+        return result
+    for entry in entries:
+        table = entry.get("table")
+        field = entry.get("field")
+        occurrences = entry.get("occurrences") or []
+        if not table or not field:
+            continue
+        table_map = result.setdefault(table, {})
+        field_list = table_map.setdefault(field, [])
+        field_list.extend(occurrences)
+    return result
+
+
+def _summarize_field_usage(entries: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    merged = _merge_field_usage(entries)
+    summary: List[Dict[str, Any]] = []
+    for table, fields in merged.items():
+        summary.append(
+            {
+                "table": table,
+                "fields": [
+                    {"name": field, "occurrences": occs}
+                    for field, occs in sorted(fields.items())
+                ],
+            }
+        )
+    return summary
+
+
+def _summarize_dependencies(
+    dependencies: Optional[List[Dict[str, Any]]],
+    filtered: Optional[List[Dict[str, Any]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    catalog: Dict[str, Dict[str, Dict[str, Any]]] = {
+        "custom": {},
+        "standard": {},
+    }
+    if dependencies:
+        for dep in dependencies:
+            symbol = dep.get("symbol")
+            category = _symbol_category(symbol)
+            if category not in catalog:
+                continue
+            catalog[category][symbol or dep.get("path", "")] = {
+                "symbol": symbol,
+                "type": dep.get("type"),
+                "path": dep.get("path"),
+                "reason": dep.get("reason"),
+            }
+    summary = {key: sorted(value.values(), key=lambda item: (item.get("symbol") or "")) for key, value in catalog.items()}
+    summary["filtered"] = filtered or []
+    return summary
 
 
 DEFAULT_MAX_DEPTH = _env_int("MAX_DEPTH_DEFAULT", 5)
@@ -498,6 +606,8 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
     allow_flags: List[Dict[str, Any]] = []
     ui_controls: List[Dict[str, Any]] = []
     control_stack: List[Dict[str, Any]] = []
+    field_usage_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    filtered_symbols: Dict[str, Dict[str, Any]] = {}
 
     # direct deps
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
@@ -506,6 +616,7 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             if not symbol:
                 continue
             if symbol in KERNEL_SKIP or len(symbol) < 3:
+                filtered_symbols.setdefault(symbol, {"symbol": symbol, "reason": "kernel-filter"})
                 continue
             folder = TYPE_PATHS.get(kind, "Unknown")
             path = f"{folder}/{symbol}.xpo"
@@ -533,7 +644,10 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         for pattern in FORM_DS_PATTERNS:
             for form_match in re.finditer(pattern, content, re.IGNORECASE):
                 symbol = form_match.group(1)
-                if symbol and symbol not in KERNEL_SKIP and len(symbol) >= 3:
+                if symbol:
+                    if symbol in KERNEL_SKIP or len(symbol) < 3:
+                        filtered_symbols.setdefault(symbol, {"symbol": symbol, "reason": "kernel-filter"})
+                        continue
                     ds_tables.add(symbol)
 
         if ds_tables:
@@ -832,6 +946,18 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         if any(token in normalized for token in ["validate", "error(", "ttsBegin", "ttsCommit"]):
             business.append({"line": line_no, "context": normalized[:200]})
 
+        for field_match in FIELD_REF_PATTERN.finditer(normalized):
+            table_name = field_match.group(1)
+            field_name = field_match.group(2)
+            if not table_name or not field_name:
+                continue
+            after_idx = field_match.end()
+            if after_idx < len(normalized) and normalized[after_idx] == "(":
+                continue
+            table_map = field_usage_map.setdefault(table_name, {})
+            occurrences = table_map.setdefault(field_name, [])
+            occurrences.append({"line": line_no, "code": normalized[:300]})
+
         method_match = METHOD_DEF_PATTERN.match(normalized)
         if method_match:
             name = method_match.group("name") or ""
@@ -881,6 +1007,14 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
             )
             crud_operations.append(enriched)
 
+    field_usage_entries: List[Dict[str, Any]] = []
+    for table, fields in field_usage_map.items():
+        for field, occurrences in fields.items():
+            field_usage_entries.append(
+                {"table": table, "field": field, "occurrences": occurrences}
+            )
+    filtered_list = list(filtered_symbols.values())
+
     log.info(
         "[extract] file=%s deps=%d ds=%d crud=%d rules=%d",
         file_path or "<mem>",
@@ -898,6 +1032,8 @@ def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[
         "allow_flags": allow_flags,
         "crud_operations": crud_operations,
         "ui_controls": ui_controls,
+        "field_usage": field_usage_entries,
+        "filtered_dependencies": filtered_list,
     }
 
 
@@ -1064,6 +1200,8 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
         "allow_flags": deps_res.get("allow_flags", []),
         "crud_operations": deps_res.get("crud_operations", []),
         "ui_controls": deps_res.get("ui_controls", []),
+        "field_usage": deps_res.get("field_usage", []),
+        "filtered_dependencies": deps_res.get("filtered_dependencies", []),
         "error": None,
     }
 
@@ -1087,6 +1225,13 @@ async def _collect_branch(
     method_summary: List[Dict[str, Any]] = []
     crud_operations_all: List[Dict[str, Any]] = []
     ui_controls_all: List[Dict[str, Any]] = []
+    field_usage_all: List[Dict[str, Any]] = []
+    filtered_all: List[Dict[str, Any]] = []
+    dependency_catalog: Dict[str, Dict[str, Dict[str, Any]]] = {
+        "custom": {},
+        "standard": {},
+    }
+    data_dictionary_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
     async def _analyze_guarded(path: str) -> Dict[str, Any]:
         if path in analysis_cache:
@@ -1154,6 +1299,8 @@ async def _collect_branch(
         allow_flags = analysis.get("allow_flags", [])
         crud_operations = analysis.get("crud_operations", [])
         ui_controls = analysis.get("ui_controls", [])
+        field_usage = analysis.get("field_usage", [])
+        filtered_local = analysis.get("filtered_dependencies", [])
         method_summary.append(
             {
                 "path": path,
@@ -1162,6 +1309,7 @@ async def _collect_branch(
                 "allow_flags": allow_flags,
                 "crud_operations": crud_operations,
                 "ui_controls": ui_controls,
+                "field_usage": field_usage,
             }
         )
         objects.append(
@@ -1176,6 +1324,8 @@ async def _collect_branch(
                 "allow_flags": allow_flags,
                 "crud_operations": crud_operations,
                 "ui_controls": ui_controls,
+                "field_usage": field_usage,
+                "filtered_dependencies": filtered_local,
             }
         )
 
@@ -1183,6 +1333,14 @@ async def _collect_branch(
         implicit_crud.extend(analysis.get("implicit_crud", []) or [])
         crud_operations_all.extend(crud_operations or [])
         ui_controls_all.extend(ui_controls or [])
+        field_usage_all.extend(field_usage or [])
+        filtered_all.extend(filtered_local or [])
+
+        merged_fields = _merge_field_usage(field_usage or [])
+        for table, fields in merged_fields.items():
+            table_entry = data_dictionary_map.setdefault(table, {})
+            for field, occurrences in fields.items():
+                table_entry.setdefault(field, []).extend(occurrences)
 
         if analysis.get("error"):
             graph.append({"file": path, "depth": depth_idx, "dependencies": [], "error": analysis["error"]})
@@ -1194,6 +1352,16 @@ async def _collect_branch(
             if not dep_path:
                 continue
             deps.append(dep_path)
+            symbol = dep.get("symbol")
+            category = _symbol_category(symbol)
+            if category in dependency_catalog:
+                key = symbol or dep_path
+                dependency_catalog[category][key] = {
+                    "symbol": symbol,
+                    "type": dep.get("type"),
+                    "path": dep_path,
+                    "reason": dep.get("reason"),
+                }
             edge_key = (path, dep_path, dep.get("reason"))
             if edge_key in seen_edges:
                 continue
@@ -1213,6 +1381,29 @@ async def _collect_branch(
     pending = sorted(set(frontier + overflow))
     status = "complete" if not more_available else "partial"
 
+    filtered_dedup: Dict[str, Dict[str, Any]] = {}
+    for entry in filtered_all:
+        key = (entry.get("symbol") or entry.get("reason") or "").lower()
+        if key in filtered_dedup:
+            continue
+        filtered_dedup[key] = entry
+    dependency_summary = {
+        "custom": sorted(dependency_catalog["custom"].values(), key=lambda item: (item.get("symbol") or "")),
+        "standard": sorted(dependency_catalog["standard"].values(), key=lambda item: (item.get("symbol") or "")),
+        "filtered": sorted(filtered_dedup.values(), key=lambda item: (item.get("symbol") or "")),
+    }
+    data_dictionary = []
+    for table, fields in data_dictionary_map.items():
+        data_dictionary.append(
+            {
+                "table": table,
+                "fields": [
+                    {"name": field, "occurrences": occurrences}
+                    for field, occurrences in sorted(fields.items())
+                ],
+            }
+        )
+
     return {
         "root": start_file,
         "ref": used_ref,
@@ -1231,6 +1422,10 @@ async def _collect_branch(
         "method_summary": method_summary,
         "crud_operations": crud_operations_all,
         "ui_controls": ui_controls_all,
+        "field_usage": field_usage_all,
+        "filtered_dependencies": dependency_summary["filtered"],
+        "dependency_summary": dependency_summary,
+        "data_dictionary": data_dictionary,
     }
 
 
@@ -1263,6 +1458,9 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
             }
         )
 
+    dependency_summary = _summarize_dependencies(analysis.get("dependencies"), analysis.get("filtered_dependencies"))
+    data_dictionary = _summarize_field_usage(analysis.get("field_usage"))
+
     response: Dict[str, Any] = {
         "root": start_file,
         "ref": analysis.get("ref", used_ref),
@@ -1280,6 +1478,10 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
         "allow_flags": analysis.get("allow_flags", []),
         "crud_operations": analysis.get("crud_operations", []),
         "ui_controls": analysis.get("ui_controls", []),
+        "field_usage": analysis.get("field_usage", []),
+        "filtered_dependencies": analysis.get("filtered_dependencies", []),
+        "dependency_summary": dependency_summary,
+        "data_dictionary": data_dictionary,
     }
     response["approx_bytes"] = _approx_size(response)
     log.info(
@@ -1337,7 +1539,18 @@ async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     trimmed, truncated = _apply_size_budget(
         max_bytes,
         branch,
-        ["edges", "objects", "business_rules", "implicit_crud", "graph", "method_summary", "crud_operations", "ui_controls"],
+        [
+            "edges",
+            "objects",
+            "business_rules",
+            "implicit_crud",
+            "graph",
+            "method_summary",
+            "crud_operations",
+            "ui_controls",
+            "field_usage",
+            "data_dictionary",
+        ],
     )
     trimmed["truncated"] = truncated
     trimmed["approx_bytes"] = _approx_size(trimmed)
