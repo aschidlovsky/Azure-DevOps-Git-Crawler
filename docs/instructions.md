@@ -12,6 +12,14 @@ Deliver a dependable blueprint for re-implementing AX/D365 .xpo assets in C#. Al
 - `POST /report.branch` – targeted branch traversal  
   *(Do not call legacy endpoints.)*
 
+## Formatting Fidelity (non-negotiable)
+
+- Treat the provided mssBDAckTableFurn example as the canonical pattern. Every summary must mirror that tone, numbering (e.g., `1.1`, `1.2`), bullet hierarchy, and depth.
+- Within each numbered subsection, use “The system must …” phrasing followed by the supporting details, just as the example shows. Use sub-bullets when the exemplar does.
+- UI sections must be rendered as Markdown tables labeled A–D with the exact column structure (“Control / Behavior”, “Button / Enabled When / Behavior”, etc.).
+- Dependency and Data Dictionary sections must follow the same structure: Business/Custom vs. Standard vs. Filtered tables, then per-table field descriptions.
+- If a section truly has no content, keep the heading and write `None`; never drop a section entirely.
+
 ## Workflow – `/report.firsthop`
 
 Request body: `{ "start_file": "<ENTRY_FILE>", "ref": "<BRANCH>", "include_source": true }`
