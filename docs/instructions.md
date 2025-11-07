@@ -24,7 +24,7 @@ Deliver a dependable blueprint for re-implementing AX/D365 .xpo assets in C#. Al
 
 Request body: `{ "start_file": "<ENTRY_FILE>", "ref": "<BRANCH>", "include_source": true }`
 
-Collect and report (all drawn directly from API fields):
+Collect and report:
 - Purpose + metadata of the entry file (path/ref/SHA/length).
 - The complete AX source (`source.content`). Only set `"include_source": false` if you explicitly need to omit the body. Every section of the summary must quote this payload directly.
 - Nothing else is pre-parsed—derive entry methods, CRUD hooks, UI controls, and narratives yourself from the retrieved code.
@@ -42,9 +42,9 @@ Use this endpoint immediately after `/report.firsthop` to obtain the direct depe
 ## Functional Requirements Sections
 
 Render every summary using **Summary Template v3.0**:
-- Six predefined subsections (Initialization, Core Interaction Logic, Data Update & Persistence, Status/State, Filtering/Query, Aggregate/Summary). If a section does not apply, write `None`.
-- All statements must mirror existing logic. Phrase requirements factually (e.g., “The form must copy PurchTable.DeliveryName into mssBDAckTable.POShipToName during initAck().”) and cite the exact snippets.
-- Parse the raw AX code yourself to surface method triggers, CRUD calls, query filters, and status gates. Reference exact line numbers and code snippets from the `source` payload.
+- Sections: Initialization, Core Interaction Logic, Data Update & Persistence, Status/State, Filtering/Query, Aggregate/Summary (use `None` if a section does not apply).
+- All statements must mirror existing logic. Phrase requirements factually (“The form must…”) and cite the exact snippet + line number from `source`.
+- Parse the AX code yourself to identify triggers, CRUD calls, query filters, and state gates.
 
 ## Narrative (“Story”)
 
@@ -52,21 +52,20 @@ Provide a top-to-bottom walkthrough: entry trigger → UI interactions → valid
 
 ## Entry Point Detail
 
-Inspect `init`, `run`, button `clicked`, datasource `executeQuery`, field `modified`, and any other entry hooks. For every method:
-- Cite context, trigger, snippet, and explanation based solely on the raw file.
-- Quote exact lines from the `source` payload; manually describe the method calls, assignments, conditions, and returns involved (no helper arrays are provided).
-- Do not group methods or skip coverage with meta statements (“similar logic”). Every hook stands alone.
+Inspect `init`, `run`, button `clicked`, datasource `executeQuery`, field `modified`, and any other entry hooks. For each method:
+- Cite context, trigger, snippet, and explanation based on the raw file.
+- Quote exact lines from `source`; manually describe the important calls, assignments, conditions, and returns.
+- Do not group methods or claim “similar logic”. Every hook stands alone.
 
 ## CRUD Hook Detail
 
-- For every explicit override (`write`, `validateWrite`, `insert`, `update`, `delete`, etc.), produce an entry mirroring the entry-point format, including line-level commentary describing the relevant assignments and conditions from the raw code.
-- For implicit operations, describe the exact statements that invoke persistence (insert/update/delete/update_recordset/etc.). If persistence is purely `FormSaveKernel`, state “No direct snippet—handled by FormSaveKernel automatically.”
+- For explicit overrides (`write`, `validateWrite`, `insert`, `update`, `delete`, etc.), mirror the entry-point format and describe the relevant assignments/conditions from the raw code.
+- For implicit operations, cite the statements that trigger persistence (insert/update/delete/update_recordset/etc.). If persistence is purely `FormSaveKernel`, write “No direct snippet—handled by FormSaveKernel automatically.”
 - Never summarize multiple hooks with a single sentence or fall back to meta statements.
 
 ## UI Highlights
 
-- Manually scan the form/tree in the `source` file to enumerate controls. For each control, use the template’s table structure (Control / Behavior) and cite the relevant handler snippets (AllowEdit, enabled, value, clicked methods, etc.).
-- Mention datasources explicitly if they supply UI-facing data or enforce Allow*/AutoDeclaration behavior.
+Scan the form/tree in `source` to enumerate controls. For each control, follow the template’s table structure and cite the relevant handler snippet (AllowEdit, enabled, clicked methods, etc.). Mention datasources if they feed UI data or enforce Allow*/AutoDeclaration behavior.
 
 ## Branch Tracker (Global Table)
 
