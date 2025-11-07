@@ -1,6 +1,6 @@
 # Connector Instructions (Functional Blueprint Mode)
 
-> Use these instructions verbatim when configuring the Copilot connector. They reference the canonical response template stored at `docs/summary_template_v1.md` (currently **Summary Template v2.0**). Every response must cite that template identifier in the opening code block so we can verify adherence. Document *only* what the code actually does—no modernization, speculation, or new functionality.
+> Use these instructions verbatim when configuring the Copilot connector. They reference the canonical response template stored at `docs/summary_template_v1.md` (currently **Summary Template v3.0**). Every response must cite that template identifier in the opening code block so we can verify adherence. Document *only* what the code actually does—no modernization, speculation, or new functionality. Quote the raw AX source returned by the API (`source` / `sources`) to support every requirement.
 
 ## Goal
 
@@ -25,20 +25,20 @@ Collect and report (all drawn directly from API fields):
 
 ## Functional Requirements Sections
 
-Render every summary using **Summary Template v2.0**:
+Render every summary using **Summary Template v3.0**:
 - Six predefined subsections (Initialization, Core Interaction Logic, Data Update & Persistence, Status/State, Filtering/Query, Aggregate/Summary). If a section does not apply, write `None`.
 - All statements must mirror existing logic. Phrase requirements factually (e.g., “The form must copy PurchTable.DeliveryName into mssBDAckTable.POShipToName during initAck().”) and cite the exact snippets.
 - Use the `calls`, `assignments`, `conditions`, `returns`, `crud_operations`, and `implicit_crud` arrays to populate each section. Reference line numbers and code tokens exactly as returned.
 
 ## Narrative (“Story”)
 
-Provide a top-to-bottom walkthrough: entry trigger → UI interactions → validations → persistence → outcomes. Reference real snippets and explain them plainly. Tie each narrative step back to the relevant method call or UI control property. **Never** introduce design commentary or recommendations.
+Provide a top-to-bottom walkthrough: entry trigger → UI interactions → validations → persistence → outcomes. Reference real snippets from the `source` / `sources` payloads and explain them plainly. Tie each narrative step back to the relevant method call or UI control property. **Never** introduce design commentary or recommendations.
 
 ## Entry Point Detail
 
 Inspect `init`, `run`, button `clicked`, datasource `executeQuery`, field `modified`, and any other entry hooks. For every method:
 - Cite context, trigger, snippet, and explanation.
-- Reference every relevant `calls`, `assignments`, `conditions`, and `returns` entry so nothing is summarized vaguely.
+- Quote exact lines from the `source` payload and cross-reference the `calls`, `assignments`, `conditions`, and `returns` arrays so nothing is summarized vaguely.
 - Do not group methods or skip coverage with meta statements (“similar logic”). Every hook stands alone.
 
 ## CRUD Hook Detail
@@ -49,7 +49,7 @@ Inspect `init`, `run`, button `clicked`, datasource `executeQuery`, field `modif
 
 ## UI Highlights
 
-- Iterate over every entry in `ui_controls`. For each control, use the template’s table structure (Control / Behavior) and draw facts from the `properties`, `hierarchy`, and relevant method assignments (AllowEdit, enabled, value, etc.). Cite control-level snippets and line numbers.
+- Iterate over every entry in `ui_controls`. For each control, use the template’s table structure (Control / Behavior) and draw facts from the `properties`, `hierarchy`, relevant handlers, and `source` snippets (AllowEdit, enabled, value, clicked methods, etc.). Cite control-level snippets and line numbers.
 - Mention datasources explicitly if they supply UI data or enforce Allow*/AutoDeclaration behavior.
 
 ## Branch Tracker (Global Table)
@@ -73,20 +73,20 @@ Request body (defaults shown):
 ```
 - If the response status is `partial` or `pending` is non-empty, rerun with higher limits unless intentionally halted (record the reason).
 - For large graphs, process child dependencies sequentially.
-- Apply the same reporting structure as first-hop (functional requirements, narrative, entry/CRUD detail, UI requirements, data dictionary, tracker update). Reference `Summary Template v2.0` for formatting.
+- Apply the same reporting structure as first-hop (functional requirements, narrative, entry/CRUD detail, UI requirements, data dictionary, tracker update). Reference `Summary Template v3.0` for formatting.
 - Use `"include_source": true` (plus `"include_source_limit": <bytes>`) when you need file bodies for every visited node. The response will include a `sources` array that aggregates content until the byte budget is consumed. Fetch any additional files through `/file` if required.
 
 ## Reporting Cadence
 
-- **First-Hop Summary** must include: Entry File metadata, Sections 1–6 from Summary Template v2.0, UI Requirements table, Dependencies, Data Dictionary, Branch Plan, Branch Status Tracker.
+- **First-Hop Summary** must include: Entry File metadata, Sections 1–11 from Summary Template v3.0, UI Requirements tables (A–D), Dependencies, Data Dictionary, Branch Plan, Branch Status Tracker.
 - **Each Branch Summary** replicates the same sections for the branch file.
 - **Final Summary** only when the tracker shows no unresolved Planned/Needs-info/In-progress entries.
 
 ## Template Compliance
 
-- Always render responses with the exact structure from `docs/summary_template_v1.md`. The opening code block must read `Summary Template v2.0`.
+- Always render responses with the exact structure from `docs/summary_template_v1.md`. The opening code block must read `Summary Template v3.0`.
 - Populate every “Key statements” / “Key bindings” bullet using the detailed arrays supplied by the backend. If an array is empty, state `None` to show it was considered.
-- Snippets must contain the actual AX statements—never placeholders. Follow every snippet with commentary so non-technical readers understand the behavior. Cite method names, data sources, and line numbers.
+- Snippets must contain the actual AX statements—never placeholders. Pull every snippet from the `source` / `sources` payloads and follow with commentary so non-technical readers understand the behavior. Cite method names, data sources, and line numbers.
 
 ## Additional Rules
 

@@ -1,89 +1,122 @@
-# Summary Template (Version 2.0)
+# Summary Template (Version 3.0)
 
-> Always mirror this template exactly. Replace the bracketed tokens with real values and delete the brackets. Keep section titles, indentation, bullet styles, dividers, and ordering unchanged. If a section has no content, include the header and note `None`. Do not deviate from the required numbering or headings.
+> Always mirror this structure exactly. Replace bracketed tokens with real values and delete the brackets. Keep section titles, numbering, indentation, bullet styles, and ordering unchanged. If a section does not apply, include the header and note `None`. Every numbered requirement must cite at least one snippet directly from the provided AX source.
 
 ```
-Summary Template v2.0
+Summary Template v3.0
+
+# **Functional Requirements — `<ObjectName>`**
+
+## 1. Form Initialization
+
+1.1 <When/condition statement (e.g., “When the form opens with PurchTable context”)>
+- Requirement: `<The system must …>`
+- Snippet:
+  ```
+  <AX code excerpt>
+  ```
+- Explanation: `<Plain-language explanation tied to the snippet, citing fields/methods>`
+
+1.2 <Next condition> … (create as many numbered sub-items as needed)
+
+## 2. Line-Level Matching / Interaction Logic
+
+2.1 <Requirement statement>  
+- Requirement: `<The system must …>`
+- Snippet:
+  ```
+  <AX code excerpt>
+  ```
+- Explanation: `<Plain-language translation>`
+
+2.2 <Additional behaviors> …
+
+## 3. Planned Ship Date / Auxiliary Updates (rename if needed)
+
+3.1 … (follow the same bullet/snippet/explanation pattern)
+
+## 4. Ship-To / Address Handling (rename to match the object)
+
+4.1 …
+
+## 5. Filtering / Query Behavior
+
+5.1 …
+
+## 6. Posting / Completion Logic
+
+6.1 …
+
+## 7. Accepting Prices / Secondary Actions
+
+7.1 …
+
+## 8. Bulk Match Operations (MatchAll, etc.)
+
+8.1 …
+
+## 9. Void / Cancel Behavior
+
+9.1 …
+
+## 10. Read-Only / Disabled Editing Conditions
+
+10.1 …
+
+## 11. Totals / Aggregate Calculations
+
+11.1 …
+
+*(Add or remove sections 3–11 as necessary, but keep numbering sequential. Each item must include Requirement + Snippet + Explanation.)*
 
 ------------------------------------------------------------
-# Functional Requirements — `<ObjectName>`
+# **UI Requirements**
 
-## 1. Initialization Behavior
-- <Describe exactly how the form/class initializes data, handles args().record()/parm(), and creates or filters datasources.>
-- Snippet:
-  ```
-  <AX code excerpt>
-  ```
-- Explanation: <Line-by-line description referencing specific calls, assignments, and conditions.>
-
-## 2. Core Interaction Logic
-- <Detail user-triggered events (button clicks, field modifications, selection changes) and helper class calls. Explain how datasources refresh after changes.>
-- Snippet:
-  ```
-  <AX code excerpt>
-  ```
-- Explanation: <Factual description tied to concrete statements.>
-
-## 3. Data Update & Persistence Behavior
-- <Describe insert/update/delete sequences, update_recordset usage, ttsBegin/ttsCommit, recalculations, and when PO or ACK records are saved.>
-- Snippet:
-  ```
-  <AX code excerpt>
-  ```
-- Explanation: <Call out each persistence statement and why it executes.>
-
-## 4. Status / State Behavior (if applicable)
-- <List every condition that locks fields, disables editing, or toggles actions. Include status values and their effects.>
-- Snippet:
-  ```
-  <AX code excerpt>
-  ```
-- Explanation: <Describe the gating logic exactly as implemented.>
-
-## 5. Filtering / Query Behavior (if applicable)
-- <Explain executeQuery overrides, dynamic ranges, exists joins, and how user selections change list results.>
-- Snippet:
-  ```
-  <AX code excerpt>
-  ```
-- Explanation: <Describe the precise query modifications and range values.>
-
-## 6. Aggregate, Total, or Summary Calculations (if applicable)
-- <Document total/summary functions, noting whether they iterate the datasource in-memory or issue queries.>
-- Snippet:
-  ```
-  <AX code excerpt>
-  ```
-- Explanation: <Describe exactly how totals are computed.>
-
-------------------------------------------------------------
-# UI Requirements
-
-- Describe editable vs. read-only controls, enablement rules, recalculation triggers, and conditional visibility without proposing redesigns.
-
+## A. Header / Overview Controls
 | Control | Behavior |
 |---------|----------|
-| `<ControlName>` | `<Explain AllowEdit rules, enablement logic, and bound datasources/events>` |
+| `<ControlName>` | `<Explain AllowEdit, enablement, and handler references with snippet citations>` |
+
+## B. Section-Specific Controls
+| Control | Rules |
+|---------|-------|
+| `<ControlName>` | `<Describe triggers, enablement, and linked methods>` |
+
+## C. Actions / Buttons
+| Button | Enabled When | Behavior |
+|--------|--------------|----------|
+| `<ButtonName>` | `<Condition>` | `<Exact action performed (cite code)>` |
+
+## D. Line Grid Behavior
+| Field | Edit Rule |
+|-------|-----------|
+| `<FieldName>` | `<Rule derived from source>` |
 
 ------------------------------------------------------------
-# Dependencies
+# **Dependencies**
 
-## Business & Custom Application Objects
-- `<ObjectName>` — `<Type>` — `<Purpose pulled directly from code usage>`
+## Business & Custom-Application Objects Used
+| Object | Type | Purpose |
+|--------|------|---------|
+| `<Name>` | `<Table/Class/Enum>` | `<Purpose derived from usage>` |
 
-## Standard Application Objects (Not Kernel)
-- `<ObjectName>` — `<Type>` — `<Purpose>`
+## Standard Application Objects (Not Kernel — Retained)
+| Object | Type | Purpose |
+|--------|------|---------|
+| `<Name>` | `<Standard table/class>` | `<Purpose>` |
 
 ## Filtered Out (Kernel / Framework / Runtime)
-- `<ObjectName>` — `Excluded because <reason>`
+| Object | Reason Removed |
+|--------|----------------|
+| `<Name>` | `Excluded because <reason>` |
 
 ------------------------------------------------------------
-# Data Dictionary
+# **Data Dictionary**
 
 ## `<TableName>`
-| Field | Description (based only on usage in this code) |
-|-------|------------------------------------------------|
-| `<FieldName>` | `<Explain how the code reads/sets/filters this field>` |
+| Field | Description (based only on code usage) |
+|-------|----------------------------------------|
+| `<FieldName>` | `<What the code reads/sets/filters>` |
 
-<Repeat for each referenced table.>
+<Repeat for each table referenced.>
 ```
