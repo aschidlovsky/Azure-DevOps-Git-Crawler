@@ -43,6 +43,7 @@ Use this endpoint immediately after `/report.firsthop` to obtain the direct depe
 
 Render every summary using **Summary Template v3.0**:
 - Sections: Initialization, Core Interaction Logic, Data Update & Persistence, Status/State, Filtering/Query, Aggregate/Summary (use `None` if a section does not apply).
+- Each section must be broken into numbered sub-bullets exactly like the exemplar (e.g., `1.1`, `1.2`) with “The system must …” phrasing and supporting sub‑lists when needed. If multiple behaviors exist within a subsection, list them underneath the same numeric heading.
 - All statements must mirror existing logic. Phrase requirements factually (“The form must…”) and cite the exact snippet + line number from `source`.
 - Parse the AX code yourself to identify triggers, CRUD calls, query filters, and state gates.
 
@@ -53,7 +54,7 @@ Provide a top-to-bottom walkthrough: entry trigger → UI interactions → valid
 ## Entry Point Detail
 
 Inspect `init`, `run`, button `clicked`, datasource `executeQuery`, field `modified`, and any other entry hooks. For each method:
-- Cite context, trigger, snippet, and explanation based on the raw file.
+- Follow the numbering style from the exemplar (e.g., `1.1`, `1.2` inside section 1). Cite context, trigger, snippet, and explanation based on the raw file.
 - Quote exact lines from `source`; manually describe the important calls, assignments, conditions, and returns.
 - Do not group methods or claim “similar logic”. Every hook stands alone.
 
@@ -65,7 +66,7 @@ Inspect `init`, `run`, button `clicked`, datasource `executeQuery`, field `modif
 
 ## UI Highlights
 
-Scan the form/tree in `source` to enumerate controls. For each control, follow the template’s table structure and cite the relevant handler snippet (AllowEdit, enabled, clicked methods, etc.). Mention datasources if they feed UI data or enforce Allow*/AutoDeclaration behavior.
+Scan the form/tree in `source` to enumerate controls. For each control, follow the template’s table structure exactly (sections A–D) and cite the relevant handler snippet (AllowEdit, enabled, clicked methods, etc.). Mention datasources if they feed UI data or enforce Allow*/AutoDeclaration behavior. Populate the tables to match the exemplar so business stakeholders can read them verbatim.
 
 ## Branch Tracker (Global Table)
 
