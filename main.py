@@ -597,447 +597,44 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 
 def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
     deps: List[Dict[str, Any]] = []
-    implicit: List[Dict[str, Any]] = []
-    business: List[Dict[str, Any]] = []
     dep_keys: Set[str] = set()
-    entry_methods: List[Dict[str, Any]] = []
-    crud_methods: List[Dict[str, Any]] = []
-    seen_entry: Set[Tuple[str, int]] = set()
-    seen_crud: Set[Tuple[str, int]] = set()
-    allow_flags: List[Dict[str, Any]] = []
-    ui_controls: List[Dict[str, Any]] = []
-    control_stack: List[Dict[str, Any]] = []
-    field_usage_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     filtered_symbols: Dict[str, Dict[str, Any]] = {}
 
-    # direct deps
+    def _record_symbol(symbol: Optional[str], kind: str, reason: str) -> None:
+        if not symbol:
+            return
+        trimmed = symbol.strip()
+        if not trimmed or trimmed in KERNEL_SKIP or len(trimmed) < 2:
+            filtered_symbols.setdefault(symbol, {"symbol": symbol, "reason": "kernel-filter"})
+            return
+        folder = TYPE_PATHS.get(kind, "Unknown")
+        path = f"{folder}/{trimmed}.xpo"
+        if path in dep_keys:
+            return
+        deps.append({"path": path, "type": kind, "symbol": trimmed, "reason": reason})
+        dep_keys.add(path)
+
     for pattern, kind, reason in DEPENDENCY_PATTERNS:
         for match in re.finditer(pattern, content, re.IGNORECASE):
             symbol = match.group(2) if reason == "statement" else match.group(1)
-            if not symbol:
-                continue
-            if symbol in KERNEL_SKIP or len(symbol) < 3:
-                filtered_symbols.setdefault(symbol, {"symbol": symbol, "reason": "kernel-filter"})
-                continue
-            folder = TYPE_PATHS.get(kind, "Unknown")
-            path = f"{folder}/{symbol}.xpo"
-            if path not in dep_keys:
-                deps.append({"path": path, "type": kind, "symbol": symbol, "reason": reason})
-                dep_keys.add(path)
+            _record_symbol(symbol, kind, reason)
 
-    # explicit CRUD calls
-    for match in CRUD_SIGNATURE.finditer(content):
-        table_sym = match.group(1)
-        if table_sym and table_sym not in KERNEL_SKIP and len(table_sym) >= 3:
-            implicit.append(
-                {
-                    "table": table_sym,
-                    "method": match.group(2) + "()",
-                    "caller": "unknown",
-                    "line": match.start(),
-                }
-            )
-
-    # Form DS → implicit DS tables + implicit CRUD
-    is_form = _looks_like_form_path(file_path or "")
-    ds_tables: Set[str] = set()
-    if is_form:
+    if _looks_like_form_path(file_path or ""):
         for pattern in FORM_DS_PATTERNS:
             for form_match in re.finditer(pattern, content, re.IGNORECASE):
-                symbol = form_match.group(1)
-                if symbol:
-                    if symbol in KERNEL_SKIP or len(symbol) < 3:
-                        filtered_symbols.setdefault(symbol, {"symbol": symbol, "reason": "kernel-filter"})
-                        continue
-                    ds_tables.add(symbol)
+                _record_symbol(form_match.group(1), "Table", "form-datasource")
 
-        if ds_tables:
-            for symbol in ds_tables:
-                table_path = f"Tables/{symbol}.xpo"
-                if table_path not in dep_keys:
-                    deps.append({"path": table_path, "type": "Table", "symbol": symbol, "reason": "form-datasource"})
-                    dep_keys.add(table_path)
-            for symbol in ds_tables:
-                for method in ["insert()", "update()", "delete()", "validateWrite()", "validateDelete()"]:
-                    implicit.append(
-                        {
-                            "table": symbol,
-                            "method": method,
-                            "caller": "FormSaveKernel",
-                            "line": -1,
-                            "reason": "implicit-form-datasource-crud",
-                        }
-                    )
-
-    lines = content.splitlines()
-
-    def _method_context(idx: int) -> str:
-        context_name: Optional[str] = None
-        context_type: Optional[str] = None
-        for back in range(idx, -1, -1):
-            stripped = _strip_xpo_hash(lines[back]).strip()
-            if not context_name and stripped.startswith("Name"):
-                parts = stripped.split("#", 1)
-                if len(parts) > 1:
-                    context_name = parts[1].strip()
-            if not context_type:
-                if stripped.startswith("CONTROL "):
-                    tokens = stripped.split()
-                    if len(tokens) >= 2:
-                        context_type = f"CONTROL {tokens[1]}"
-                elif stripped.startswith("DATASOURCE"):
-                    context_type = "DATASOURCE"
-                elif stripped.startswith("FORM "):
-                    context_type = "FORM"
-                elif stripped.startswith("OBJECTPOOL"):
-                    context_type = "OBJECTPOOL"
-            if context_name and context_type:
-                break
-        parts: List[str] = []
-        if context_type:
-            parts.append(context_type)
-        if context_name:
-            parts.append(context_name)
-        return " > ".join(parts) if parts else "FORM"
-
-    def _capture_method_body(idx: int) -> Tuple[str, List[Dict[str, Any]]]:
-        snippet_lines: List[str] = []
-        detail_lines: List[Dict[str, Any]] = []
-        brace_depth = 0
-        seen_body = False
-        for pointer in range(idx, len(lines)):
-            cleaned = _strip_xpo_hash(lines[pointer]).rstrip()
-            snippet_lines.append(cleaned)
-            detail_lines.append({"line": pointer + 1, "text": cleaned})
-            brace_depth += cleaned.count("{")
-            brace_depth -= cleaned.count("}")
-            if "{" in cleaned:
-                seen_body = True
-            if seen_body and brace_depth <= 0:
-                break
-            if len(snippet_lines) >= 80:
-                break
-        snippet_text = "\n".join(snippet_lines).strip()
-        filtered_lines = [entry for entry in detail_lines if (entry.get("text") or "").strip()]
-        return snippet_text, filtered_lines
-
-    def _extract_method_operations(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not body_lines:
-            return []
-        operations: List[Dict[str, Any]] = []
-        for entry in body_lines:
-            stripped_line = (entry.get("text") or "").strip()
-            if not stripped_line:
-                continue
-            actual_line = entry.get("line")
-            match = re.search(r"\bupdate_recordset\s+([A-Za-z_][A-Za-z0-9_]*)", stripped_line, re.IGNORECASE)
-            if match:
-                operations.append(
-                    {
-                        "operation": "update_recordset",
-                        "target": match.group(1),
-                        "code": stripped_line,
-                        "line": actual_line,
-                    }
-                )
-            match = re.search(r"\binsert_recordset\s+([A-Za-z_][A-Za-z0-9_]*)", stripped_line, re.IGNORECASE)
-            if match:
-                operations.append(
-                    {
-                        "operation": "insert_recordset",
-                        "target": match.group(1),
-                        "code": stripped_line,
-                        "line": actual_line,
-                    }
-                )
-            match = re.search(r"\bdelete_from\s+([A-Za-z_][A-Za-z0-9_]*)", stripped_line, re.IGNORECASE)
-            if match:
-                operations.append(
-                    {
-                        "operation": "delete_from",
-                        "target": match.group(1),
-                        "code": stripped_line,
-                        "line": actual_line,
-                    }
-                )
-            match = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\.(insert|update|delete)\s*\(", stripped_line, re.IGNORECASE)
-            if match:
-                operations.append(
-                    {
-                        "operation": match.group(2).lower(),
-                        "target": match.group(1),
-                        "code": stripped_line,
-                        "line": actual_line,
-                    }
-                )
-        return operations
-    
-    def _extract_method_calls(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        calls: List[Dict[str, Any]] = []
-        seen: Set[Tuple[int, str]] = set()
-        for entry in body_lines:
-            text = (entry.get("text") or "").strip()
-            if not text:
-                continue
-            for match in CALL_PATTERN.finditer(text):
-                target = match.group(1)
-                if not target:
-                    continue
-                normalized = target.lower()
-                if normalized in CALL_KEYWORDS:
-                    continue
-                key = (entry.get("line") or 0, target)
-                if key in seen:
-                    continue
-                seen.add(key)
-                call_type = "static" if "::" in target else ("instance" if "." in target else "local")
-                calls.append(
-                    {
-                        "call": target,
-                        "call_type": call_type,
-                        "line": entry.get("line"),
-                        "code": text,
-                    }
-                )
-        return calls
-
-    def _extract_method_assignments(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        assignments: List[Dict[str, Any]] = []
-        for entry in body_lines:
-            text = (entry.get("text") or "").strip()
-            if not text or "=" not in text:
-                continue
-            if "==" in text or "<=" in text or ">=" in text or "!=" in text:
-                continue
-            left, right = text.split("=", 1)
-            left = left.strip()
-            right = right.strip().rstrip(";")
-            if not left or left.lower() in {"select"}:
-                continue
-            assignments.append(
-                {
-                    "left": left,
-                    "right": right,
-                    "line": entry.get("line"),
-                    "code": text,
-                }
-            )
-        return assignments
-
-    def _extract_method_conditions(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        conditions: List[Dict[str, Any]] = []
-        for entry in body_lines:
-            text = (entry.get("text") or "").strip()
-            if not text:
-                continue
-            lower = text.lower()
-            if lower.startswith(("if ", "if(", "while ", "while(", "switch", "for ", "for(")):
-                conditions.append(
-                    {
-                        "condition": text,
-                        "line": entry.get("line"),
-                        "code": text,
-                    }
-                )
-        return conditions
-
-    def _extract_method_returns(body_lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        returns: List[Dict[str, Any]] = []
-        for entry in body_lines:
-            text = (entry.get("text") or "").strip()
-            if not text:
-                continue
-            lower = text.lower()
-            if lower.startswith("return"):
-                value = text[6:].strip().rstrip(";")
-                returns.append(
-                    {
-                        "value": value,
-                        "line": entry.get("line"),
-                        "code": text,
-                    }
-                )
-        return returns
-    
-    def _finalize_control(ctrl: Dict[str, Any], ancestors: List[Dict[str, Any]], end_line: int) -> None:
-        ctrl["end_line"] = end_line
-        lines_in_block: List[Dict[str, Any]] = ctrl.get("lines", [])
-        properties: List[Dict[str, Any]] = []
-        for entry in lines_in_block:
-            text = (entry.get("text") or "").strip()
-            if not text or text.upper().startswith(("CONTROL", "ENDCONTROL", "METHOD", "PROPERTIES")):
-                continue
-            prop_match = CONTROL_PROPERTY_PATTERN.match(text)
-            if prop_match:
-                prop_name = prop_match.group("prop")
-                if prop_name.lower() == "name":
-                    continue
-                value = prop_match.group("value").rstrip(";")
-                properties.append(
-                    {
-                        "property": prop_name,
-                        "value": value.strip(),
-                        "line": entry.get("line"),
-                    }
-                )
-        hierarchy_parts: List[str] = []
-        for ancestor in ancestors:
-            ancestor_name = ancestor.get("name") or f"{ancestor.get('control_type')}@{ancestor.get('start_line')}"
-            hierarchy_parts.append(ancestor_name)
-        current_name = ctrl.get("name") or f"{ctrl.get('control_type')}@{ctrl.get('start_line')}"
-        hierarchy_parts.append(current_name)
-        snippet = "\n".join(
-            entry.get("text", "")
-            for entry in lines_in_block
-            if entry.get("text", "").strip()
-        )
-        if len(snippet) > 6000:
-            snippet = snippet[:6000]
-        ui_controls.append(
-            {
-                "name": ctrl.get("name") or current_name,
-                "control_type": ctrl.get("control_type"),
-                "hierarchy": " > ".join(hierarchy_parts) if hierarchy_parts else None,
-                "start_line": ctrl.get("start_line"),
-                "end_line": ctrl.get("end_line"),
-                "properties": properties,
-                "snippet": snippet,
-            }
-        )
-
-    # UI controls stack
-    for line_no, raw_line in enumerate(lines, start=1):
-        cleaned_line = _strip_xpo_hash(raw_line).rstrip()
-        stripped = cleaned_line.strip()
-        match_control = UI_CONTROL_PATTERN.match(stripped)
-        if match_control:
-            control_stack.append(
-                {
-                    "control_type": match_control.group(1),
-                    "start_line": line_no,
-                    "lines": [{"line": line_no, "text": cleaned_line}],
-                    "name": None,
-                }
-            )
-            continue
-
-        if control_stack:
-            control_stack[-1]["lines"].append({"line": line_no, "text": cleaned_line})
-
-        match_name = NAME_PROPERTY_PATTERN.match(stripped)
-        if match_name and control_stack:
-            control_stack[-1]["name"] = match_name.group(1).strip()
-            continue
-
-        if stripped.upper().startswith("ENDCONTROL") and control_stack:
-            current = control_stack.pop()
-            _finalize_control(current, control_stack, line_no)
-
-    while control_stack:
-        current = control_stack.pop()
-        end_line = current.get("lines", [{}])[-1].get("line", len(lines))
-        _finalize_control(current, control_stack, end_line)
-
-    # Business-rule signals
-    for line_no, raw_line in enumerate(lines, start=1):
-        normalized = _strip_xpo_hash(raw_line).strip()
-        if not normalized:
-            continue
-
-        if any(token in normalized for token in ["validate", "error(", "ttsBegin", "ttsCommit"]):
-            business.append({"line": line_no, "context": normalized[:200]})
-
-        for field_match in FIELD_REF_PATTERN.finditer(normalized):
-            table_name = field_match.group(1)
-            field_name = field_match.group(2)
-            if not table_name or not field_name:
-                continue
-            after_idx = field_match.end()
-            if after_idx < len(normalized) and normalized[after_idx] == "(":
-                continue
-            table_map = field_usage_map.setdefault(table_name, {})
-            occurrences = table_map.setdefault(field_name, [])
-            occurrences.append({"line": line_no, "code": normalized[:300]})
-
-        method_match = METHOD_DEF_PATTERN.match(normalized)
-        if method_match:
-            name = method_match.group("name") or ""
-            lower = name.lower()
-            snippet_text, body_lines = _capture_method_body(line_no - 1)
-            info = {
-                "name": name,
-                "line": line_no,
-                "signature": normalized[:200],
-                "context": _method_context(line_no - 1),
-                "snippet": snippet_text,
-                "body_lines": body_lines,
-            }
-            info["operations"] = _extract_method_operations(body_lines)
-            info["calls"] = _extract_method_calls(body_lines)
-            info["assignments"] = _extract_method_assignments(body_lines)
-            info["conditions"] = _extract_method_conditions(body_lines)
-            info["returns"] = _extract_method_returns(body_lines)
-            if lower in ENTRY_METHOD_NAMES and (lower, line_no) not in seen_entry:
-                entry_methods.append(info)
-                seen_entry.add((lower, line_no))
-            if lower in CRUD_METHOD_NAMES and (lower, line_no) not in seen_crud:
-                crud_methods.append(info)
-                seen_crud.add((lower, line_no))
-
-        allow_match = ALLOW_FLAG_PATTERN.search(normalized)
-        if allow_match:
-            flag = {
-                "property": f"Allow{allow_match.group(1)}",
-                "value": allow_match.group(2).capitalize(),
-                "line": line_no,
-                "context": normalized[:200],
-            }
-            allow_flags.append(flag)
-
-    crud_operations: List[Dict[str, Any]] = []
-    for method in entry_methods + crud_methods:
-        for operation in method.get("operations") or []:
-            enriched = dict(operation)
-            enriched.update(
-                {
-                    "method": method.get("name"),
-                    "method_context": method.get("context"),
-                    "method_line": method.get("line"),
-                    "method_snippet": method.get("snippet"),
-                }
-            )
-            crud_operations.append(enriched)
-
-    field_usage_entries: List[Dict[str, Any]] = []
-    for table, fields in field_usage_map.items():
-        for field, occurrences in fields.items():
-            field_usage_entries.append(
-                {"table": table, "field": field, "occurrences": occurrences}
-            )
     filtered_list = list(filtered_symbols.values())
-
     log.info(
-        "[extract] file=%s deps=%d ds=%d crud=%d rules=%d",
+        "[extract] file=%s deps=%d filtered=%d",
         file_path or "<mem>",
         len(deps),
-        len(ds_tables),
-        len(implicit),
-        len(business),
+        len(filtered_list),
     )
     return {
         "dependencies": deps,
-        "implicit_crud": implicit,
-        "business_rules": business,
-        "entry_methods": entry_methods,
-        "crud_methods": crud_methods,
-        "allow_flags": allow_flags,
-        "crud_operations": crud_operations,
-        "ui_controls": ui_controls,
-        "field_usage": field_usage_entries,
         "filtered_dependencies": filtered_list,
     }
-
-
 # =========================================
 # CLASSIFICATION + RETRY
 # =========================================
@@ -1134,15 +731,7 @@ async def deps_get(
         "ref": used_ref,
         "sha": sha,
         "dependencies": paged,
-        "business_rules": parsed["business_rules"],
-        "implicit_crud": parsed["implicit_crud"],
-        "entry_methods": parsed["entry_methods"],
-        "crud_methods": parsed["crud_methods"],
-        "allow_flags": parsed["allow_flags"],
-        "crud_operations": parsed["crud_operations"],
-        "unresolved": [],
-        "visited": [file],
-        "skipped": [],
+        "filtered_dependencies": parsed["filtered_dependencies"],
         "page": page,
         "limit": limit,
         "total_dependencies": total,
@@ -1168,13 +757,7 @@ async def _analyze_single_file(path: str, ref: Optional[str], return_content: bo
             "sha": file_res.get("sha"),
             "content_len": len(file_res.get("content", "")),
             "dependencies": [],
-            "business_rules": [],
-            "implicit_crud": [],
-            "entry_methods": [],
-            "crud_methods": [],
-            "allow_flags": [],
-            "crud_operations": [],
-            "ui_controls": [],
+            "filtered_dependencies": [],
             "error": f"deps_get: {exc}",
         }
 
@@ -1195,14 +778,6 @@ async def _analyze_single_file(path: str, ref: Optional[str], return_content: bo
         "sha": deps_res.get("sha") or file_res.get("sha"),
         "content_len": len(file_res.get("content", "")),
         "dependencies": norm_deps,
-        "business_rules": deps_res.get("business_rules", []),
-        "implicit_crud": deps_res.get("implicit_crud", []),
-        "entry_methods": deps_res.get("entry_methods", []),
-        "crud_methods": deps_res.get("crud_methods", []),
-        "allow_flags": deps_res.get("allow_flags", []),
-        "crud_operations": deps_res.get("crud_operations", []),
-        "ui_controls": deps_res.get("ui_controls", []),
-        "field_usage": deps_res.get("field_usage", []),
         "filtered_dependencies": deps_res.get("filtered_dependencies", []),
         "error": None,
     }
@@ -1229,16 +804,11 @@ async def _collect_branch(
     depths: Dict[str, int] = {}
     visit_order: List[str] = []
     overflow: List[str] = []
-    method_summary: List[Dict[str, Any]] = []
-    crud_operations_all: List[Dict[str, Any]] = []
-    ui_controls_all: List[Dict[str, Any]] = []
-    field_usage_all: List[Dict[str, Any]] = []
-    filtered_all: List[Dict[str, Any]] = []
     dependency_catalog: Dict[str, Dict[str, Dict[str, Any]]] = {
         "custom": {},
         "standard": {},
     }
-    data_dictionary_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    filtered_all: List[Dict[str, Any]] = []
 
     async def _analyze_guarded(path: str, need_content: bool = False) -> Dict[str, Any]:
         cached = analysis_cache.get(path)
@@ -1284,9 +854,7 @@ async def _collect_branch(
                 continue
             for dep in analysis.get("dependencies", []) or []:
                 dep_path = dep.get("path")
-                if not dep_path or dep_path in depths:
-                    continue
-                if dep_path in next_frontier:
+                if not dep_path or dep_path in depths or dep_path in next_frontier:
                     continue
                 if len(visit_order) + len(next_frontier) < max_files:
                     next_frontier.append(dep_path)
@@ -1302,72 +870,21 @@ async def _collect_branch(
 
     graph: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
-    business_rules: List[Dict[str, Any]] = []
-    implicit_crud: List[Dict[str, Any]] = []
-    objects: List[Dict[str, Any]] = []
     seen_edges: Set[Tuple[str, str, Optional[str]]] = set()
 
     for path in visit_order:
         analysis = await _analyze_guarded(path, include_sources)
         depth_idx = depths.get(path, -1)
-        entry_methods = analysis.get("entry_methods", [])
-        crud_methods = analysis.get("crud_methods", [])
-        allow_flags = analysis.get("allow_flags", [])
-        crud_operations = analysis.get("crud_operations", [])
-        ui_controls = analysis.get("ui_controls", [])
-        field_usage = analysis.get("field_usage", [])
-        filtered_local = analysis.get("filtered_dependencies", [])
-        method_summary.append(
-            {
-                "path": path,
-                "entry_methods": entry_methods,
-                "crud_methods": crud_methods,
-                "allow_flags": allow_flags,
-                "crud_operations": crud_operations,
-                "ui_controls": ui_controls,
-                "field_usage": field_usage,
-            }
-        )
-        objects.append(
-            {
-                "path": analysis.get("path", path),
-                "ref": analysis.get("ref", used_ref),
-                "sha": analysis.get("sha", "unknown"),
-                "depth": depth_idx,
-                "error": analysis.get("error"),
-                "entry_methods": entry_methods,
-                "crud_methods": crud_methods,
-                "allow_flags": allow_flags,
-                "crud_operations": crud_operations,
-                "ui_controls": ui_controls,
-                "field_usage": field_usage,
-                "filtered_dependencies": filtered_local,
-            }
-        )
+        deps = analysis.get("dependencies", []) or []
+        filtered_local = analysis.get("filtered_dependencies", []) or []
+        filtered_all.extend(filtered_local)
 
-        business_rules.extend(analysis.get("business_rules", []) or [])
-        implicit_crud.extend(analysis.get("implicit_crud", []) or [])
-        crud_operations_all.extend(crud_operations or [])
-        ui_controls_all.extend(ui_controls or [])
-        field_usage_all.extend(field_usage or [])
-        filtered_all.extend(filtered_local or [])
-
-        merged_fields = _merge_field_usage(field_usage or [])
-        for table, fields in merged_fields.items():
-            table_entry = data_dictionary_map.setdefault(table, {})
-            for field, occurrences in fields.items():
-                table_entry.setdefault(field, []).extend(occurrences)
-
-        if analysis.get("error"):
-            graph.append({"file": path, "depth": depth_idx, "dependencies": [], "error": analysis["error"]})
-            continue
-
-        deps = []
-        for dep in analysis.get("dependencies", []) or []:
+        dep_paths: List[str] = []
+        for dep in deps:
             dep_path = dep.get("path")
             if not dep_path:
                 continue
-            deps.append(dep_path)
+            dep_paths.append(dep_path)
             symbol = dep.get("symbol")
             category = _symbol_category(symbol)
             if category in dependency_catalog:
@@ -1392,7 +909,7 @@ async def _collect_branch(
                 }
             )
 
-        graph.append({"file": path, "depth": depth_idx, "dependencies": deps, "error": None})
+        graph.append({"file": path, "depth": depth_idx, "dependencies": dep_paths})
 
     pending = sorted(set(frontier + overflow))
     status = "complete" if not more_available else "partial"
@@ -1403,22 +920,12 @@ async def _collect_branch(
         if key in filtered_dedup:
             continue
         filtered_dedup[key] = entry
+
     dependency_summary = {
         "custom": sorted(dependency_catalog["custom"].values(), key=lambda item: (item.get("symbol") or "")),
         "standard": sorted(dependency_catalog["standard"].values(), key=lambda item: (item.get("symbol") or "")),
         "filtered": sorted(filtered_dedup.values(), key=lambda item: (item.get("symbol") or "")),
     }
-    data_dictionary = []
-    for table, fields in data_dictionary_map.items():
-        data_dictionary.append(
-            {
-                "table": table,
-                "fields": [
-                    {"name": field, "occurrences": occurrences}
-                    for field, occurrences in sorted(fields.items())
-                ],
-            }
-        )
 
     sources: List[Dict[str, Any]] = []
     if include_sources:
@@ -1457,22 +964,11 @@ async def _collect_branch(
         "limit_reached": limit_reached,
         "pending": pending,
         "graph": graph,
-        "objects": objects,
         "edges": edges,
-        "business_rules": business_rules,
-        "implicit_crud": implicit_crud,
         "status": status,
-        "method_summary": method_summary,
-        "crud_operations": crud_operations_all,
-        "ui_controls": ui_controls_all,
-        "field_usage": field_usage_all,
-        "filtered_dependencies": dependency_summary["filtered"],
         "dependency_summary": dependency_summary,
-        "data_dictionary": data_dictionary,
         "sources": sources,
     }
-
-
 @app.post("/report.firsthop")
 @app.post("/report.firsthop/")
 async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
@@ -1491,23 +987,6 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
     analysis = await _analyze_single_file(start_file, used_ref, return_content=include_source)
     status = "ok" if not analysis.get("error") else "error"
 
-    dep_summary: Dict[str, int] = {}
-    direct: List[Dict[str, Any]] = []
-    for dep in analysis.get("dependencies", []) or []:
-        dtype = dep.get("type", "Unknown")
-        dep_summary[dtype] = dep_summary.get(dtype, 0) + 1
-        direct.append(
-            {
-                "path": dep.get("path"),
-                "type": dep.get("type"),
-                "symbol": dep.get("symbol"),
-                "reason": dep.get("reason"),
-            }
-        )
-
-    dependency_summary = _summarize_dependencies(analysis.get("dependencies"), analysis.get("filtered_dependencies"))
-    data_dictionary = _summarize_field_usage(analysis.get("field_usage"))
-
     response: Dict[str, Any] = {
         "root": start_file,
         "ref": analysis.get("ref", used_ref),
@@ -1515,20 +994,6 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
         "content_len": analysis.get("content_len", 0),
         "status": status,
         "error": analysis.get("error"),
-        "direct_dependencies": direct,
-        "dependency_counts": dep_summary,
-        "implicit_crud": analysis.get("implicit_crud", []),
-        "business_rules": analysis.get("business_rules", []),
-        "total_dependencies": len(direct),
-        "entry_methods": analysis.get("entry_methods", []),
-        "crud_methods": analysis.get("crud_methods", []),
-        "allow_flags": analysis.get("allow_flags", []),
-        "crud_operations": analysis.get("crud_operations", []),
-        "ui_controls": analysis.get("ui_controls", []),
-        "field_usage": analysis.get("field_usage", []),
-        "filtered_dependencies": analysis.get("filtered_dependencies", []),
-        "dependency_summary": dependency_summary,
-        "data_dictionary": data_dictionary,
     }
     if include_source:
         source_content = analysis.get("content")
@@ -1542,7 +1007,45 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
             }
     response["approx_bytes"] = _approx_size(response)
     log.info(
-        "[report.firsthop] root=%s deps=%s approx_bytes=%s status=%s",
+        "[report.firsthop] root=%s approx_bytes=%s status=%s",
+        start_file,
+        response["approx_bytes"],
+        status,
+    )
+    return response
+
+
+@app.post("/report.dependencies")
+@app.post("/report.dependencies/")
+async def report_dependencies(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    env = get_env()
+    start_file = payload.get("start_file")
+    if not start_file:
+        raise HTTPException(400, "Missing required field: start_file")
+
+    used_ref: str = payload.get("ref") or env["REF"]
+    if str(used_ref).upper() == "HEAD":
+        used_ref = env["REF"]
+
+    analysis = await _analyze_single_file(start_file, used_ref, return_content=False)
+    status = "ok" if not analysis.get("error") else "error"
+    direct = analysis.get("dependencies", []) or []
+    dependency_summary = _summarize_dependencies(direct, analysis.get("filtered_dependencies"))
+
+    response = {
+        "root": start_file,
+        "ref": analysis.get("ref", used_ref),
+        "sha": analysis.get("sha", "unknown"),
+        "status": status,
+        "error": analysis.get("error"),
+        "total_dependencies": len(direct),
+        "direct_dependencies": direct,
+        "dependency_summary": dependency_summary,
+        "filtered_dependencies": analysis.get("filtered_dependencies", []),
+    }
+    response["approx_bytes"] = _approx_size(response)
+    log.info(
+        "[report.dependencies] root=%s deps=%s approx_bytes=%s status=%s",
         start_file,
         len(direct),
         response["approx_bytes"],
@@ -1613,15 +1116,7 @@ async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         branch,
         [
             "edges",
-            "objects",
-            "business_rules",
-            "implicit_crud",
             "graph",
-            "method_summary",
-            "crud_operations",
-            "ui_controls",
-            "field_usage",
-            "data_dictionary",
             "sources",
         ],
     )

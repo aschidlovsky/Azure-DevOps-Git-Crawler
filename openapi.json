@@ -3,17 +3,11 @@
   "info": {
     "title": "ADO Repo Dependency Connector",
     "version": "1.4.0",
-    "description": "API for exploring Dynamics AX / D365 X++ dependencies in Azure DevOps Git repositories."
+    "description": "API for exploring Dynamics AX / D365 X++ source files and dependency graphs."
   },
   "servers": [
-    {
-      "url": "https://your-host-name.example.com",
-      "description": "Deployed service"
-    },
-    {
-      "url": "http://localhost:8080",
-      "description": "Local development"
-    }
+    { "url": "https://your-host-name.example.com", "description": "Deployed service" },
+    { "url": "http://localhost:8080", "description": "Local development" }
   ],
   "paths": {
     "/health": {
@@ -25,15 +19,7 @@
             "description": "Service is up",
             "content": {
               "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "status": {
-                      "type": "string",
-                      "example": "ok"
-                    }
-                  }
-                }
+                "schema": { "type": "object", "properties": { "status": { "type": "string", "example": "ok" } } }
               }
             }
           }
@@ -42,106 +28,36 @@
     },
     "/file": {
       "get": {
-        "summary": "Fetch File Content",
+        "summary": "Fetch a file from the repo",
         "operationId": "getFile",
         "parameters": [
-          {
-            "name": "path",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            },
-            "description": "Repository-relative path (e.g. Forms/CustTable.xpo)"
-          },
-          {
-            "name": "ref",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "description": "Branch or tag; defaults to DEFAULT_REF"
-          }
+          { "in": "query", "name": "path", "required": true, "schema": { "type": "string" }, "description": "Repo path (e.g., Forms/CustTable.xpo)" },
+          { "in": "query", "name": "ref", "schema": { "type": "string" }, "description": "Branch or tag; defaults to DEFAULT_REF" }
         ],
         "responses": {
-          "200": {
-            "description": "File retrieved",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FileResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "File not found"
-          }
+          "200": { "description": "File returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FileResponse" } } } },
+          "404": { "description": "File not found" }
         }
       }
     },
     "/deps": {
       "get": {
-        "summary": "Extract Direct Dependencies",
+        "summary": "List direct dependencies for a file",
         "operationId": "getDeps",
         "parameters": [
-          {
-            "name": "file",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            },
-            "description": "Path to the .xpo file"
-          },
-          {
-            "name": "ref",
-            "in": "query",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "page",
-            "in": "query",
-            "schema": {
-              "type": "integer",
-              "default": 1,
-              "minimum": 1
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "schema": {
-              "type": "integer",
-              "default": 200,
-              "minimum": 1,
-              "maximum": 500
-            }
-          }
+          { "in": "query", "name": "file", "required": true, "schema": { "type": "string" }, "description": "Repo path to .xpo" },
+          { "in": "query", "name": "ref", "schema": { "type": "string" }, "description": "Branch or tag" },
+          { "in": "query", "name": "page", "schema": { "type": "integer", "default": 1 } },
+          { "in": "query", "name": "limit", "schema": { "type": "integer", "default": 200 } }
         ],
         "responses": {
-          "200": {
-            "description": "Dependencies found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DepsResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Source file not found"
-          }
+          "200": { "description": "Dependencies returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DepsPageResponse" } } } }
         }
       }
     },
     "/report.firsthop": {
       "post": {
-        "summary": "Analyze an entry file (depth 1)",
+        "summary": "Return file metadata + raw content",
         "operationId": "postReportFirstHop",
         "requestBody": {
           "required": true,
@@ -151,40 +67,46 @@
                 "type": "object",
                 "required": ["start_file"],
                 "properties": {
-                  "start_file": {
-                    "type": "string",
-                    "description": "Entry file to analyze"
-                  },
-                  "ref": {
-                    "type": "string",
-                    "description": "Branch or tag; defaults to DEFAULT_REF"
-                  },
-                  "include_source": {
-                    "type": "boolean",
-                    "description": "When true, include the raw file content for the entry file"
-                  }
+                  "start_file": { "type": "string", "description": "Entry file to analyze" },
+                  "ref": { "type": "string", "description": "Branch or tag; defaults to DEFAULT_REF" },
+                  "include_source": { "type": "boolean", "description": "Include file content (defaults to true)" }
                 }
               }
             }
           }
         },
         "responses": {
-          "200": {
-            "description": "Direct dependencies returned",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FirstHopResponse"
+          "200": { "description": "File returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FirstHopResponse" } } } }
+        }
+      }
+    },
+    "/report.dependencies": {
+      "post": {
+        "summary": "Return direct dependency list",
+        "operationId": "postReportDependencies",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["start_file"],
+                "properties": {
+                  "start_file": { "type": "string" },
+                  "ref": { "type": "string" }
                 }
               }
             }
           }
+        },
+        "responses": {
+          "200": { "description": "Dependencies returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DependenciesResponse" } } } }
         }
       }
     },
     "/report.branch": {
       "post": {
-        "summary": "Traverse a single dependency branch",
+        "summary": "Traverse a dependency branch",
         "operationId": "postReportBranch",
         "requestBody": {
           "required": true,
@@ -194,64 +116,21 @@
                 "type": "object",
                 "required": ["start_file"],
                 "properties": {
-                  "start_file": {
-                    "type": "string",
-                    "description": "Root of the branch to explore"
-                  },
-                  "ref": {
-                    "type": "string",
-                    "description": "Branch or tag; defaults to DEFAULT_REF"
-                  },
-                  "max_depth": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 5,
-                    "description": "Maximum depth to traverse"
-                  },
-                  "max_files": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 80,
-                    "description": "Maximum number of files to analyze"
-                  },
-                  "max_concurrency": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 6
-                  },
-                  "max_bytes": {
-                    "type": "integer",
-                    "minimum": 1000,
-                    "default": 350000,
-                    "description": "Approximate response size budget"
-                  },
-                  "include_source": {
-                    "type": "boolean",
-                    "description": "When true, include file contents for visited nodes (limited by include_source_limit)"
-                  },
-                  "include_source_limit": {
-                    "type": "integer",
-                    "description": "Max cumulative bytes of source content to return when include_source=true"
-                  }
+                  "start_file": { "type": "string" },
+                  "ref": { "type": "string" },
+                  "max_depth": { "type": "integer", "default": 5 },
+                  "max_files": { "type": "integer", "default": 80 },
+                  "max_concurrency": { "type": "integer", "default": 6 },
+                  "max_bytes": { "type": "integer", "default": 350000 },
+                  "include_source": { "type": "boolean", "description": "If true, include file bodies for visited nodes" },
+                  "include_source_limit": { "type": "integer", "description": "Total bytes available for included sources" }
                 }
               }
             }
           }
         },
         "responses": {
-          "200": {
-            "description": "Branch traversal completed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BranchResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Missing required fields"
-          }
+          "200": { "description": "Branch traversal", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BranchResponse" } } } }
         }
       }
     }
@@ -261,883 +140,137 @@
       "FileResponse": {
         "type": "object",
         "properties": {
-          "path": {
-            "type": "string"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "sha": {
-            "type": "string"
-          },
-          "content": {
-            "type": "string"
-          }
+          "path": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "content": { "type": "string" }
         }
       },
       "Dependency": {
         "type": "object",
         "properties": {
-          "path": {
-            "type": "string"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["Table", "Class", "Form", "Map", "Unknown"]
-          },
-          "symbol": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          }
-        }
-      },
-      "ImplicitCrud": {
-        "type": "object",
-        "properties": {
-          "table": {
-            "type": "string"
-          },
-          "method": {
-            "type": "string"
-          },
-          "caller": {
-            "type": "string"
-          },
-          "line": {
-            "type": "integer"
-          },
-          "reason": {
-            "type": "string"
-          }
-        }
-      },
-      "BusinessRule": {
-        "type": "object",
-        "properties": {
-          "line": {
-            "type": "integer"
-          },
-          "context": {
-            "type": "string"
-          }
-        }
-      },
-      "DepsResponse": {
-        "type": "object",
-        "properties": {
-          "file": {
-            "type": "string"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "sha": {
-            "type": "string"
-          },
-          "dependencies": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Dependency"
-            }
-          },
-          "business_rules": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/BusinessRule"
-            }
-          },
-          "implicit_crud": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ImplicitCrud"
-            }
-          },
-          "unresolved": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "visited": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "skipped": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "page": {
-            "type": "integer"
-          },
-          "limit": {
-            "type": "integer"
-          },
-          "total_dependencies": {
-            "type": "integer"
-          },
-          "total_pages": {
-            "type": "integer"
-          }
-        }
-      },
-      "FirstHopResponse": {
-        "type": "object",
-        "properties": {
-          "root": {
-            "type": "string"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "sha": {
-            "type": "string"
-          },
-          "content_len": {
-            "type": "integer"
-          },
-          "status": {
-            "type": "string",
-            "example": "ok"
-          },
-          "error": {
-            "type": "string",
-            "nullable": true
-          },
-          "direct_dependencies": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Dependency"
-            }
-          },
-          "dependency_counts": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "integer"
-            }
-          },
-          "implicit_crud": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ImplicitCrud"
-            }
-          },
-          "business_rules": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/BusinessRule"
-            }
-          },
-          "total_dependencies": {
-            "type": "integer"
-          },
-          "entry_methods": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MethodHit"
-            }
-          },
-          "crud_methods": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MethodHit"
-            }
-          },
-          "crud_operations": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CrudOperation"
-            }
-          },
-          "allow_flags": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AllowFlag"
-            }
-          },
-          "crud_operations": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CrudOperation"
-            }
-          },
-          "ui_controls": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/UIControl"
-            }
-          },
-          "approx_bytes": {
-            "type": "integer"
-          }
-        }
-      },
-      "GraphNode": {
-        "type": "object",
-        "properties": {
-          "file": {
-            "type": "string"
-          },
-          "depth": {
-            "type": "integer"
-          },
-          "dependencies": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "error": {
-            "type": "string",
-            "nullable": true
-          }
-        }
-      },
-      "BranchObject": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "sha": {
-            "type": "string"
-          },
-          "depth": {
-            "type": "integer"
-          },
-          "error": {
-            "type": "string",
-            "nullable": true
-          },
-          "entry_methods": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MethodHit"
-            }
-          },
-          "crud_methods": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MethodHit"
-            }
-          },
-          "allow_flags": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AllowFlag"
-            }
-          },
-          "ui_controls": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/UIControl"
-            }
-          },
-          "field_usage": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FieldUsageEntry"
-            }
-          },
-          "filtered_dependencies": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FilteredDependency"
-            }
-          }
-        }
-      },
-      "Edge": {
-        "type": "object",
-        "properties": {
-          "from": {
-            "type": "string"
-          },
-          "to": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "type": {
-            "type": "string"
-          },
-          "depth_from_root": {
-            "type": "integer"
-          }
-        }
-      },
-      "BranchResponse": {
-        "type": "object",
-        "properties": {
-          "root": {
-            "type": "string"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "max_depth": {
-            "type": "integer"
-          },
-          "depth_completed": {
-            "type": "integer"
-          },
-          "visited": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "visited_count": {
-            "type": "integer"
-          },
-          "limit_reached": {
-            "type": "boolean"
-          },
-          "pending": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "graph": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/GraphNode"
-            }
-          },
-          "objects": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/BranchObject"
-            }
-          },
-          "edges": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Edge"
-            }
-          },
-          "business_rules": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/BusinessRule"
-            }
-          },
-          "implicit_crud": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ImplicitCrud"
-            }
-          },
-          "crud_operations": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CrudOperation"
-            }
-          },
-          "ui_controls": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/UIControl"
-            }
-          },
-          "status": {
-            "type": "string",
-            "example": "complete"
-          },
-          "max_files": {
-            "type": "integer"
-          },
-          "max_concurrency": {
-            "type": "integer"
-          },
-          "max_bytes": {
-            "type": "integer"
-          },
-          "truncated": {
-            "type": "boolean"
-          },
-          "approx_bytes": {
-            "type": "integer"
-          },
-          "method_summary": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MethodSummary"
-            }
-          },
-          "field_usage": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FieldUsageEntry"
-            }
-          },
-          "filtered_dependencies": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FilteredDependency"
-            }
-          },
-          "dependency_summary": {
-            "$ref": "#/components/schemas/DependencySummary"
-          },
-          "data_dictionary": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/TableFieldDetail"
-            }
-          },
-          "sources": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FileSource"
-            }
-          }
-        }
-      },
-      "MethodHit": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "line": {
-            "type": "integer"
-          },
-          "signature": {
-            "type": "string"
-          },
-          "context": {
-            "type": "string",
-            "description": "Control/datasource/form context for this method"
-          },
-          "snippet": {
-            "type": "string",
-            "description": "Full method body snippet"
-          },
-          "body_lines": {
-            "type": "array",
-            "description": "Individual method body lines with source numbers",
-            "items": {
-              "$ref": "#/components/schemas/MethodLine"
-            }
-          },
-          "operations": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CrudOperation"
-            },
-            "description": "CRUD operations detected within this method"
-          },
-          "calls": {
-            "type": "array",
-            "description": "Function or method invocations inside the body",
-            "items": {
-              "$ref": "#/components/schemas/MethodCall"
-            }
-          },
-          "assignments": {
-            "type": "array",
-            "description": "Assignments performed inside the method",
-            "items": {
-              "$ref": "#/components/schemas/MethodAssignment"
-            }
-          },
-          "conditions": {
-            "type": "array",
-            "description": "Conditional statements encountered inside the method",
-            "items": {
-              "$ref": "#/components/schemas/MethodCondition"
-            }
-          },
-          "returns": {
-            "type": "array",
-            "description": "Return statements within the method body",
-            "items": {
-              "$ref": "#/components/schemas/MethodReturn"
-            }
-          }
-        }
-      },
-      "MethodLine": {
-        "type": "object",
-        "properties": {
-          "line": {
-            "type": "integer",
-            "description": "Line number within the file"
-          },
-          "text": {
-            "type": "string",
-            "description": "Source code for the line"
-          }
-        }
-      },
-      "MethodCall": {
-        "type": "object",
-        "properties": {
-          "call": {
-            "type": "string",
-            "description": "Called function or method identifier"
-          },
-          "call_type": {
-            "type": "string",
-            "description": "static, instance, or local"
-          },
-          "line": {
-            "type": "integer",
-            "description": "Line number of the call"
-          },
-          "code": {
-            "type": "string",
-            "description": "Full source line containing the call"
-          }
-        }
-      },
-      "MethodAssignment": {
-        "type": "object",
-        "properties": {
-          "left": {
-            "type": "string",
-            "description": "Assignment target"
-          },
-          "right": {
-            "type": "string",
-            "description": "Assigned value/expression"
-          },
-          "line": {
-            "type": "integer",
-            "description": "Line number of the assignment"
-          },
-          "code": {
-            "type": "string",
-            "description": "Full source line for the assignment"
-          }
-        }
-      },
-      "MethodCondition": {
-        "type": "object",
-        "properties": {
-          "condition": {
-            "type": "string",
-            "description": "Conditional expression text"
-          },
-          "line": {
-            "type": "integer",
-            "description": "Line number of the condition"
-          },
-          "code": {
-            "type": "string",
-            "description": "Full source line of the conditional statement"
-          }
-        }
-      },
-      "MethodReturn": {
-        "type": "object",
-        "properties": {
-          "value": {
-            "type": "string",
-            "description": "Return expression (empty if none)"
-          },
-          "line": {
-            "type": "integer",
-            "description": "Line number of the return statement"
-          },
-          "code": {
-            "type": "string",
-            "description": "Full source line of the return statement"
-          }
-        }
-      },
-      "AllowFlag": {
-        "type": "object",
-        "properties": {
-          "property": {
-            "type": "string"
-          },
-          "value": {
-            "type": "string"
-          },
-          "line": {
-            "type": "integer"
-          },
-          "context": {
-            "type": "string"
-          }
-        }
-      },
-      "CrudOperation": {
-        "type": "object",
-        "properties": {
-          "operation": {
-            "type": "string",
-            "description": "Operation type such as update_recordset, insert, update, delete"
-          },
-          "target": {
-            "type": "string",
-            "description": "Table or alias targeted by the operation"
-          },
-          "code": {
-            "type": "string",
-            "description": "Exact AX code line containing the operation"
-          },
-          "line": {
-            "type": "integer",
-            "description": "Line number within the file"
-          },
-          "method": {
-            "type": "string",
-            "description": "Containing method name"
-          },
-          "method_context": {
-            "type": "string",
-            "description": "Control/datasource/form context for the method"
-          },
-          "method_line": {
-            "type": "integer",
-            "description": "Line number where the method is declared"
-          },
-          "method_snippet": {
-            "type": "string",
-            "description": "Full method body snippet"
-          }
-        }
-      },
-      "UIControl": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Control name as declared in the form"
-          },
-          "control_type": {
-            "type": "string",
-            "description": "Control type (Button, CheckBox, etc.)"
-          },
-          "hierarchy": {
-            "type": "string",
-            "nullable": true,
-            "description": "Hierarchy path (parent controls) for this control"
-          },
-          "start_line": {
-            "type": "integer",
-            "nullable": true,
-            "description": "Line number where the control starts"
-          },
-          "end_line": {
-            "type": "integer",
-            "nullable": true,
-            "description": "Line number where the control ends"
-          },
-          "properties": {
-            "type": "array",
-            "description": "Key properties pulled from the control block",
-            "items": {
-              "$ref": "#/components/schemas/UIControlProperty"
-            }
-          },
-          "snippet": {
-            "type": "string",
-            "description": "Raw control block snippet (truncated)"
-          }
-        }
-      },
-      "UIControlProperty": {
-        "type": "object",
-        "properties": {
-          "property": {
-            "type": "string",
-            "description": "Property name within the control block"
-          },
-          "value": {
-            "type": "string",
-            "description": "Property value"
-          },
-          "line": {
-            "type": "integer",
-            "description": "Source line number for the property"
-          }
-        }
-      },
-      "FileSource": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "sha": {
-            "type": "string"
-          },
-          "bytes": {
-            "type": "integer",
-            "description": "Size of the returned content in bytes"
-          },
-          "content": {
-            "type": "string",
-            "description": "Raw file content (UTF-8 text)"
-          }
-        }
-      },
-      "FieldUsageEntry": {
-        "type": "object",
-        "properties": {
-          "table": {
-            "type": "string"
-          },
-          "field": {
-            "type": "string"
-          },
-          "occurrences": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FieldOccurrence"
-            }
-          }
-        }
-      },
-      "FieldOccurrence": {
-        "type": "object",
-        "properties": {
-          "line": {
-            "type": "integer"
-          },
-          "code": {
-            "type": "string"
-          }
+          "path": { "type": "string" },
+          "type": { "type": "string" },
+          "symbol": { "type": "string" },
+          "reason": { "type": "string" }
         }
       },
       "FilteredDependency": {
         "type": "object",
         "properties": {
-          "symbol": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          }
-        }
-      },
-      "DependencySummary": {
-        "type": "object",
-        "properties": {
-          "custom": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DependencySummaryItem"
-            }
-          },
-          "standard": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DependencySummaryItem"
-            }
-          },
-          "filtered": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FilteredDependency"
-            }
-          }
+          "symbol": { "type": "string" },
+          "reason": { "type": "string" }
         }
       },
       "DependencySummaryItem": {
         "type": "object",
         "properties": {
-          "symbol": {
-            "type": "string"
-          },
-          "type": {
-            "type": "string"
-          },
-          "path": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          }
+          "symbol": { "type": "string" },
+          "type": { "type": "string" },
+          "path": { "type": "string" },
+          "reason": { "type": "string" }
         }
       },
-      "TableFieldDetail": {
+      "DependencySummary": {
         "type": "object",
         "properties": {
-          "table": {
-            "type": "string"
-          },
-          "fields": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/TableFieldEntry"
-            }
-          }
+          "custom": { "type": "array", "items": { "$ref": "#/components/schemas/DependencySummaryItem" } },
+          "standard": { "type": "array", "items": { "$ref": "#/components/schemas/DependencySummaryItem" } },
+          "filtered": { "type": "array", "items": { "$ref": "#/components/schemas/FilteredDependency" } }
         }
       },
-      "TableFieldEntry": {
+      "DepsPageResponse": {
         "type": "object",
         "properties": {
-          "name": {
-            "type": "string"
-          },
-          "occurrences": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FieldOccurrence"
-            }
-          }
+          "file": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/Dependency" } },
+          "filtered_dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/FilteredDependency" } },
+          "page": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "total_dependencies": { "type": "integer" },
+          "total_pages": { "type": "integer" }
         }
       },
-      "MethodSummary": {
+      "FirstHopResponse": {
         "type": "object",
         "properties": {
-          "path": {
-            "type": "string"
-          },
-          "entry_methods": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MethodHit"
-            }
-          },
-          "crud_methods": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/MethodHit"
-            }
-          },
-          "allow_flags": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AllowFlag"
-            }
-          },
-          "crud_operations": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/CrudOperation"
-            }
-          },
-          "ui_controls": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/UIControl"
-            }
-          },
-          "field_usage": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/FieldUsageEntry"
-            }
-          }
+          "root": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "content_len": { "type": "integer" },
+          "status": { "type": "string" },
+          "error": { "type": "string", "nullable": true },
+          "source": { "$ref": "#/components/schemas/FileSource" },
+          "approx_bytes": { "type": "integer" }
+        }
+      },
+      "DependenciesResponse": {
+        "type": "object",
+        "properties": {
+          "root": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "status": { "type": "string" },
+          "error": { "type": "string", "nullable": true },
+          "total_dependencies": { "type": "integer" },
+          "direct_dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/Dependency" } },
+          "filtered_dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/FilteredDependency" } },
+          "dependency_summary": { "$ref": "#/components/schemas/DependencySummary" },
+          "approx_bytes": { "type": "integer" }
+        }
+      },
+      "GraphNode": {
+        "type": "object",
+        "properties": {
+          "file": { "type": "string" },
+          "depth": { "type": "integer" },
+          "dependencies": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "GraphEdge": {
+        "type": "object",
+        "properties": {
+          "from": { "type": "string" },
+          "to": { "type": "string" },
+          "reason": { "type": "string" },
+          "type": { "type": "string" },
+          "depth_from_root": { "type": "integer" }
+        }
+      },
+      "BranchResponse": {
+        "type": "object",
+        "properties": {
+          "root": { "type": "string" },
+          "ref": { "type": "string" },
+          "max_depth": { "type": "integer" },
+          "depth_completed": { "type": "integer" },
+          "visited": { "type": "array", "items": { "type": "string" } },
+          "visited_count": { "type": "integer" },
+          "limit_reached": { "type": "boolean" },
+          "pending": { "type": "array", "items": { "type": "string" } },
+          "graph": { "type": "array", "items": { "$ref": "#/components/schemas/GraphNode" } },
+          "edges": { "type": "array", "items": { "$ref": "#/components/schemas/GraphEdge" } },
+          "status": { "type": "string" },
+          "dependency_summary": { "$ref": "#/components/schemas/DependencySummary" },
+          "sources": { "type": "array", "items": { "$ref": "#/components/schemas/FileSource" } },
+          "max_files": { "type": "integer" },
+          "max_concurrency": { "type": "integer" },
+          "max_bytes": { "type": "integer" },
+          "include_source_limit": { "type": "integer", "nullable": true },
+          "truncated": { "type": "boolean" },
+          "approx_bytes": { "type": "integer" }
+        }
+      },
+      "FileSource": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "bytes": { "type": "integer" },
+          "content": { "type": "string" }
         }
       }
     }
