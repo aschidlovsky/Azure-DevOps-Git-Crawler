@@ -347,6 +347,7 @@ def _summarize_dependencies(
 DEFAULT_MAX_DEPTH = _env_int("MAX_DEPTH_DEFAULT", 5)
 DEFAULT_MAX_CONCURRENCY = _env_int("MAX_CONCURRENCY_DEFAULT", 6)
 DEFAULT_MAX_BYTES = _env_int("MAX_BYTES_DEFAULT", 350_000)
+DEFAULT_SOURCE_BUDGET = _env_int("SOURCE_BYTES_DEFAULT", 750_000)
 DEFAULT_MAX_FILES = _env_int("MAX_FILES_DEFAULT", 80)
 
 _CACHE_TTL_SECONDS = _env_int("ITEM_CACHE_TTL", 600)
@@ -1149,12 +1150,13 @@ async def deps_get(
     }
 
 
-async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
+async def _analyze_single_file(path: str, ref: Optional[str], return_content: bool = False) -> Dict[str, Any]:
     # fetch file
     try:
         file_res = await file_get(path=path, ref=ref)  # type: ignore[call-arg]
     except Exception as exc:  # noqa: BLE001
         return {"path": path, "ref": ref, "error": f"file_get: {exc}"}
+    file_content = file_res.get("content") if return_content else None
 
     # analyze deps
     try:
@@ -1204,6 +1206,9 @@ async def _analyze_single_file(path: str, ref: Optional[str]) -> Dict[str, Any]:
         "filtered_dependencies": deps_res.get("filtered_dependencies", []),
         "error": None,
     }
+    if return_content and file_content is not None:
+        result["content"] = file_content
+    return result
 
 
 # =========================================
@@ -1216,6 +1221,8 @@ async def _collect_branch(
     max_depth: int,
     max_files: int,
     max_concurrency: int,
+    include_sources: bool = False,
+    source_budget: Optional[int] = None,
 ) -> Dict[str, Any]:
     sem = Semaphore(max_concurrency)
     analysis_cache: Dict[str, Dict[str, Any]] = {}
@@ -1233,11 +1240,20 @@ async def _collect_branch(
     }
     data_dictionary_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
-    async def _analyze_guarded(path: str) -> Dict[str, Any]:
-        if path in analysis_cache:
-            return analysis_cache[path]
+    async def _analyze_guarded(path: str, need_content: bool = False) -> Dict[str, Any]:
+        cached = analysis_cache.get(path)
+        if cached and (not need_content or cached.get("content") is not None):
+            return cached
         async with sem:
-            analysis = await _analyze_single_file(path, used_ref)
+            analysis = await _analyze_single_file(path, used_ref, return_content=need_content)
+        if cached:
+            merged = dict(cached)
+            for key, value in analysis.items():
+                if key == "content" and not need_content:
+                    continue
+                merged[key] = value
+            analysis_cache[path] = merged
+            return merged
         analysis_cache[path] = analysis
         return analysis
 
@@ -1258,7 +1274,7 @@ async def _collect_branch(
         if not level:
             break
 
-        analyses = await asyncio.gather(*[_analyze_guarded(path) for path in level])
+        analyses = await asyncio.gather(*[_analyze_guarded(path, include_sources) for path in level])
 
         next_frontier: List[str] = []
         for path, analysis in zip(level, analyses):
@@ -1292,7 +1308,7 @@ async def _collect_branch(
     seen_edges: Set[Tuple[str, str, Optional[str]]] = set()
 
     for path in visit_order:
-        analysis = await _analyze_guarded(path)
+        analysis = await _analyze_guarded(path, include_sources)
         depth_idx = depths.get(path, -1)
         entry_methods = analysis.get("entry_methods", [])
         crud_methods = analysis.get("crud_methods", [])
@@ -1404,6 +1420,33 @@ async def _collect_branch(
             }
         )
 
+    sources: List[Dict[str, Any]] = []
+    if include_sources:
+        remaining = source_budget if source_budget and source_budget > 0 else None
+        for path in visit_order:
+            analysis = analysis_cache.get(path)
+            if not analysis or analysis.get("content") is None:
+                analysis = await _analyze_guarded(path, True)
+            content = analysis.get("content")
+            if not content:
+                continue
+            size_bytes = len(content.encode("utf-8"))
+            if remaining is not None and size_bytes > remaining:
+                continue
+            sources.append(
+                {
+                    "path": path,
+                    "ref": analysis.get("ref", used_ref),
+                    "sha": analysis.get("sha", "unknown"),
+                    "bytes": size_bytes,
+                    "content": content,
+                }
+            )
+            if remaining is not None:
+                remaining -= size_bytes
+                if remaining <= 0:
+                    break
+
     return {
         "root": start_file,
         "ref": used_ref,
@@ -1426,6 +1469,7 @@ async def _collect_branch(
         "filtered_dependencies": dependency_summary["filtered"],
         "dependency_summary": dependency_summary,
         "data_dictionary": data_dictionary,
+        "sources": sources,
     }
 
 
@@ -1441,7 +1485,9 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
     if str(used_ref).upper() == "HEAD":
         used_ref = env["REF"]
 
-    analysis = await _analyze_single_file(start_file, used_ref)
+    include_source = bool(payload.get("include_source", False))
+
+    analysis = await _analyze_single_file(start_file, used_ref, return_content=include_source)
     status = "ok" if not analysis.get("error") else "error"
 
     dep_summary: Dict[str, int] = {}
@@ -1483,6 +1529,16 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
         "dependency_summary": dependency_summary,
         "data_dictionary": data_dictionary,
     }
+    if include_source:
+        source_content = analysis.get("content")
+        if source_content is not None:
+            response["source"] = {
+                "path": start_file,
+                "ref": analysis.get("ref", used_ref),
+                "sha": analysis.get("sha", "unknown"),
+                "bytes": len(source_content.encode("utf-8")),
+                "content": source_content,
+            }
     response["approx_bytes"] = _approx_size(response)
     log.info(
         "[report.firsthop] root=%s deps=%s approx_bytes=%s status=%s",
@@ -1523,18 +1579,33 @@ async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     except Exception:
         max_bytes = DEFAULT_MAX_BYTES
 
+    include_source = bool(payload.get("include_source", False))
+    source_limit: Optional[int] = None
+    if include_source:
+        raw_limit = payload.get("include_source_limit")
+        try:
+            source_limit = int(raw_limit) if raw_limit is not None else DEFAULT_SOURCE_BUDGET
+        except Exception:
+            source_limit = DEFAULT_SOURCE_BUDGET
+        if source_limit is not None and source_limit < 0:
+            source_limit = None
+
     branch = await _collect_branch(
         start_file=start_file,
         used_ref=used_ref,
         max_depth=max_depth,
         max_files=max_files,
         max_concurrency=max_concurrency,
+        include_sources=include_source,
+        source_budget=source_limit,
     )
 
     branch["max_depth"] = max_depth
     branch["max_files"] = max_files
     branch["max_concurrency"] = max_concurrency
     branch["max_bytes"] = max_bytes
+    if include_source:
+        branch["include_source_limit"] = source_limit
 
     trimmed, truncated = _apply_size_budget(
         max_bytes,
@@ -1550,6 +1621,7 @@ async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             "ui_controls",
             "field_usage",
             "data_dictionary",
+            "sources",
         ],
     )
     trimmed["truncated"] = truncated

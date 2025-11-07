@@ -14,12 +14,13 @@ Deliver a dependable blueprint for re-implementing AX/D365 .xpo assets in C#. Al
 
 ## Workflow – `/report.firsthop`
 
-Request body: `{ "start_file": "<ENTRY_FILE>", "ref": "<BRANCH>" }`
+Request body: `{ "start_file": "<ENTRY_FILE>", "ref": "<BRANCH>", "include_source": false }`
 
 Collect and report (all drawn directly from API fields):
 - Purpose + metadata of the entry file.
 - Legitimate dependencies (noise filtered) plus `dependency_summary` (custom vs. standard vs. filtered).
 - `entry_methods`, `crud_methods`, `allow_flags`, `implicit_crud`, `crud_operations`, `ui_controls`, `field_usage`, `data_dictionary`, `filtered_dependencies`.
+- Set `"include_source": true` whenever the summary must quote the raw AX code. The response will add a `source` object containing the full file body (subject to size limits).
 - Branch plan (dependency list marked Planned / Skipped-with-reason / Needs-info).
 
 ## Functional Requirements Sections
@@ -73,6 +74,7 @@ Request body (defaults shown):
 - If the response status is `partial` or `pending` is non-empty, rerun with higher limits unless intentionally halted (record the reason).
 - For large graphs, process child dependencies sequentially.
 - Apply the same reporting structure as first-hop (functional requirements, narrative, entry/CRUD detail, UI requirements, data dictionary, tracker update). Reference `Summary Template v2.0` for formatting.
+- Use `"include_source": true` (plus `"include_source_limit": <bytes>`) when you need file bodies for every visited node. The response will include a `sources` array that aggregates content until the byte budget is consumed. Fetch any additional files through `/file` if required.
 
 ## Reporting Cadence
 

@@ -158,6 +158,10 @@
                   "ref": {
                     "type": "string",
                     "description": "Branch or tag; defaults to DEFAULT_REF"
+                  },
+                  "include_source": {
+                    "type": "boolean",
+                    "description": "When true, include the raw file content for the entry file"
                   }
                 }
               }
@@ -220,6 +224,14 @@
                     "minimum": 1000,
                     "default": 350000,
                     "description": "Approximate response size budget"
+                  },
+                  "include_source": {
+                    "type": "boolean",
+                    "description": "When true, include file contents for visited nodes (limited by include_source_limit)"
+                  },
+                  "include_source_limit": {
+                    "type": "integer",
+                    "description": "Max cumulative bytes of source content to return when include_source=true"
                   }
                 }
               }
@@ -683,6 +695,12 @@
             "items": {
               "$ref": "#/components/schemas/TableFieldDetail"
             }
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileSource"
+            }
           }
         }
       },
@@ -946,6 +964,28 @@
           "line": {
             "type": "integer",
             "description": "Source line number for the property"
+          }
+        }
+      },
+      "FileSource": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "sha": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer",
+            "description": "Size of the returned content in bytes"
+          },
+          "content": {
+            "type": "string",
+            "description": "Raw file content (UTF-8 text)"
           }
         }
       },
