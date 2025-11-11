@@ -971,6 +971,8 @@ async def _collect_branch(
     }
 @app.post("/report.firsthop")
 @app.post("/report.firsthop/")
+@app.post("//report.firsthop")
+@app.post("//report.firsthop/")
 async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     env = get_env()
     start_file = payload.get("start_file")
@@ -1017,6 +1019,8 @@ async def report_firsthop(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]
 
 @app.post("/report.dependencies")
 @app.post("/report.dependencies/")
+@app.post("//report.dependencies")
+@app.post("//report.dependencies/")
 async def report_dependencies(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     env = get_env()
     start_file = payload.get("start_file")
@@ -1056,6 +1060,8 @@ async def report_dependencies(payload: Dict[str, Any] = Body(...)) -> Dict[str, 
 
 @app.post("/report.branch")
 @app.post("/report.branch/")
+@app.post("//report.branch")
+@app.post("//report.branch/")
 async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     env = get_env()
     start_file: Optional[str] = payload.get("start_file")
