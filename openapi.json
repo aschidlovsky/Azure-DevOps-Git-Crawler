@@ -257,7 +257,8 @@
           "path": { "type": "string" },
           "reason": { "type": "string" },
           "impact": { "type": "string" },
-          "roles": { "type": "array", "items": { "type": "string" } }
+          "roles": { "type": "array", "items": { "type": "string" } },
+          "impact_score": { "type": "integer" }
         }
       },
       "DependencySummary": {
@@ -333,6 +334,7 @@
           "depth_from_root": { "type": "integer" },
           "impact": { "type": "string" },
           "roles": { "type": "array", "items": { "type": "string" } },
+          "impact_score": { "type": "integer" },
           "should_traverse": { "type": "boolean" },
           "skip_reason": { "type": "string", "nullable": true }
         }
@@ -349,6 +351,7 @@
           "occurrences": { "type": "array", "items": { "$ref": "#/components/schemas/DependencyOccurrence" } },
           "impact": { "type": "string" },
           "edge_roles": { "type": "array", "items": { "type": "string" } },
+          "impact_score": { "type": "integer" },
           "should_traverse": { "type": "boolean" },
           "skip_reason": { "type": "string", "nullable": true }
         }

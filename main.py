@@ -268,6 +268,32 @@ _EXTRA_STANDARD = {
     if symbol.strip()
 }
 STANDARD_OBJECTS = STANDARD_OBJECTS_BASE.union(_EXTRA_STANDARD)
+BEHAVIOR_DENYLIST_SYMBOLS = {
+    "info",
+    "warning",
+    "error",
+    "debug",
+    "strfmt",
+    "datetimeutil",
+    "date",
+    "time",
+    "any2str",
+    "conpeek",
+    "confind",
+    "conlen",
+    "applversion",
+    "applname",
+    "classidget",
+    "typeidget",
+}
+BEHAVIOR_DENYLIST_PREFIXES = (
+    "con",
+    "str",
+    "num",
+    "time",
+    "date",
+    "any2",
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -482,6 +508,22 @@ def _classify_on_name_heuristics(symbol: str, suggested_kind: str) -> List[str]:
     return tries
 
 
+def _is_behavior_denylisted(symbol: Optional[str]) -> bool:
+    if not symbol:
+        return False
+    lowered = symbol.lower()
+    if lowered in BEHAVIOR_DENYLIST_SYMBOLS:
+        return True
+    for prefix in BEHAVIOR_DENYLIST_PREFIXES:
+        if lowered.startswith(prefix):
+            return True
+    if lowered.endswith("2str"):
+        return True
+    if "::" in lowered and lowered.split("::", 1)[0] in {"box", "dialog"}:
+        return True
+    return False
+
+
 def _index_methods(methods: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
     indexed: Dict[str, Dict[str, Any]] = {}
     if not methods:
@@ -497,56 +539,121 @@ def _index_methods(methods: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[st
 def _classify_dependency_edge(
     dependency: Dict[str, Any],
     method_index: Dict[str, Dict[str, Any]],
+    field_usage_map: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     roles: Set[str] = set()
     reason_details = dependency.get("reason_details") or []
     dep_type = (dependency.get("type") or "").lower()
     call_sites = dependency.get("call_sites") or []
+    occurrences = dependency.get("occurrences") or []
     lowered_reasons = [reason.lower() for reason in reason_details if isinstance(reason, str)]
+    symbol = dependency.get("symbol")
+    symbol_lower = (symbol or "").lower()
+
+    bool_call = bool(call_sites)
+    bool_branch = False
+    bool_crud = False
+    bool_field = False
+    bool_transaction = False
+    bool_ui = False
+    bool_exception = False
 
     if dep_type == "table":
         if any(reason.startswith("crud") for reason in lowered_reasons):
-            roles.add("data_write")
-        elif any(reason in {"statement", "form-datasource", "datasource()"} for reason in lowered_reasons):
-            roles.add("data_read")
-        else:
-            if any((occ.get("snippet") or "").lower().startswith("select") for occ in dependency.get("occurrences", []) or []):
-                roles.add("data_read")
+            bool_crud = True
+        if any(reason in {"statement", "form-datasource", "datasource()"} for reason in lowered_reasons):
+            bool_field = True
+        if field_usage_map and symbol_lower in field_usage_map:
+            bool_field = True
+
+    for occ in occurrences:
+        snippet = (occ.get("snippet") or "").lower()
+        if not snippet:
+            continue
+        if "throw" in snippet or "error" in snippet or "checkfailed" in snippet or "warning(" in snippet:
+            bool_exception = True
+        if any(token in snippet for token in [".insert", ".doinsert", ".update", ".doupdate", ".delete", "select "]):
+            bool_crud = True
+        if "ttsbegin" in snippet or "ttscommit" in snippet:
+            bool_transaction = True
 
     for site in call_sites:
         context = (site.get("context") or "").lower()
-        if context in {"condition", "return"}:
-            roles.add("control_flow")
-        if context == "assignment":
-            roles.add("calculation")
+        if context in {"condition", "return", "assignment"}:
+            bool_branch = True
         if site.get("ui_related"):
-            roles.add("ui_hook")
+            bool_ui = True
         method = method_index.get(site.get("method"))
         if not method:
             continue
-        if method.get("crud_operations"):
-            roles.add("data_write")
         if method.get("transactions"):
-            roles.add("transactional")
+            bool_transaction = True
         if "ui_entry" in (method.get("roles") or []):
-            roles.add("ui_hook")
+            bool_ui = True
+        if symbol_lower and method.get("field_refs"):
+            for ref in method.get("field_refs", []):
+                if (ref.get("table") or "").lower() == symbol_lower:
+                    bool_field = True
+                    break
 
-    if not roles and dependency.get("reason") == "static-call" and call_sites:
-        roles.add("control_flow")
+    if dep_type == "table" and not bool_ui:
+        if any(reason == "form-datasource" for reason in lowered_reasons):
+            bool_ui = True
 
-    if "data_write" in roles or "control_flow" in roles or "ui_hook" in roles or "transactional" in roles:
-        impact = "high"
-    elif "data_read" in roles or "calculation" in roles:
-        impact = "medium"
+    bool_call = bool_call or bool_branch
+
+    if bool_call:
+        roles.add("call")
+    if bool_crud:
+        roles.add("crud")
+    if bool_field:
+        roles.add("field")
+    if bool_transaction:
+        roles.add("transaction")
+    if bool_ui:
+        roles.add("ui")
+    if bool_exception:
+        roles.add("exception")
+
+    impact_score = 0
+    if bool_crud:
+        impact_score += 4
+    if bool_transaction:
+        impact_score += 3
+    if bool_exception:
+        impact_score += 3
+    if bool_branch:
+        impact_score += 2
+    if bool_field:
+        impact_score += 2
+    if bool_ui:
+        impact_score += 1
+    if bool_call and impact_score == 0:
+        impact_score = 1
+
+    if roles:
+        impact = "+".join(sorted(roles))
+    elif bool_branch:
+        impact = "return-used"
     else:
-        impact = "low"
+        impact = "reference"
 
-    should_traverse = impact != "low"
-    skip_reason = None if should_traverse else "low-impact"
+    return_used = bool_branch
+    should_traverse = impact_score > 0 or return_used or dep_type == "table"
+
+    skip_reason: Optional[str] = None
+    if not should_traverse:
+        if _is_behavior_denylisted(symbol):
+            skip_reason = "denylist"
+        elif bool_call:
+            skip_reason = "pure helper, unused result"
+        else:
+            skip_reason = "reference-only"
 
     return {
         "edge_roles": sorted(roles),
         "impact": impact,
+        "impact_score": impact_score,
         "should_traverse": should_traverse,
         "skip_reason": skip_reason,
     }
@@ -1113,8 +1220,10 @@ async def _collect_branch(
         fanout_cap = fanout_limit
 
     def _edge_priority(entry: Dict[str, Any]) -> Tuple[int, str]:
-        rank = {"high": 0, "medium": 1, "low": 2}.get(entry.get("impact"), 2)
-        return (rank, entry.get("symbol") or entry.get("path") or "")
+        score = entry.get("impact_score")
+        if score is None:
+            score = 0
+        return (-int(score), entry.get("symbol") or entry.get("path") or "")
 
     while frontier and depth <= max_depth and len(visit_order) < max_files:
         level: List[str] = []
@@ -1142,6 +1251,12 @@ async def _collect_branch(
             filtered_local = analysis.get("filtered_dependencies", []) or []
             filtered_all.extend(filtered_local)
             method_index = _index_methods(analysis.get("methods"))
+            field_usage_map: Dict[str, Any] = {}
+            for usage in analysis.get("field_usage") or []:
+                table_name = usage.get("table")
+                if not table_name:
+                    continue
+                field_usage_map[table_name.lower()] = usage
 
             classified_deps: List[Dict[str, Any]] = []
             for dep in deps:
@@ -1149,7 +1264,7 @@ async def _collect_branch(
                 if not dep_path:
                     continue
                 enriched = dict(dep)
-                enriched.update(_classify_dependency_edge(dep, method_index))
+                enriched.update(_classify_dependency_edge(dep, method_index, field_usage_map))
                 enriched["from"] = path
                 enriched["depth_from_root"] = depth_idx + 1
                 classified_deps.append(enriched)
@@ -1165,6 +1280,7 @@ async def _collect_branch(
                         "reason": dep.get("reason"),
                         "impact": enriched.get("impact"),
                         "roles": enriched.get("edge_roles"),
+                        "impact_score": enriched.get("impact_score"),
                     }
 
             classified_deps.sort(key=_edge_priority)
@@ -1215,6 +1331,7 @@ async def _collect_branch(
                         "depth_from_root": dep.get("depth_from_root"),
                         "impact": dep.get("impact"),
                         "roles": dep.get("edge_roles"),
+                        "impact_score": dep.get("impact_score"),
                         "should_traverse": dep.get("should_traverse"),
                         "skip_reason": dep.get("skip_reason"),
                     }
