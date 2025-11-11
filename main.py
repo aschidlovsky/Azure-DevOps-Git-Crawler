@@ -170,6 +170,8 @@ FORM_DS_PATTERNS = [
     r"\bDataSource\s*(\s*(\w+)\s*)",
     r"\bDATA\s+SOURCE\s+(\w+)",
 ]
+DEPENDENCY_REGEXES = [(re.compile(pattern, re.IGNORECASE), kind, reason) for pattern, kind, reason in DEPENDENCY_PATTERNS]
+FORM_DS_REGEXES = [re.compile(pattern, re.IGNORECASE) for pattern in FORM_DS_PATTERNS]
 
 CRUD_SIGNATURE = re.compile(
     r"\b(\w+)\.(insert|update|delete|validateWrite|validateDelete)\s*\(",
@@ -349,6 +351,7 @@ DEFAULT_MAX_CONCURRENCY = _env_int("MAX_CONCURRENCY_DEFAULT", 6)
 DEFAULT_MAX_BYTES = _env_int("MAX_BYTES_DEFAULT", 350_000)
 DEFAULT_SOURCE_BUDGET = _env_int("SOURCE_BYTES_DEFAULT", 750_000)
 DEFAULT_MAX_FILES = _env_int("MAX_FILES_DEFAULT", 80)
+DEFAULT_MAX_FANOUT = _env_int("MAX_FANOUT_DEFAULT", 12)
 
 _CACHE_TTL_SECONDS = _env_int("ITEM_CACHE_TTL", 600)
 _ITEM_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -479,6 +482,122 @@ def _classify_on_name_heuristics(symbol: str, suggested_kind: str) -> List[str]:
     return tries
 
 
+def _index_methods(methods: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    indexed: Dict[str, Dict[str, Any]] = {}
+    if not methods:
+        return indexed
+    for method in methods:
+        name = method.get("name")
+        if not name or name in indexed:
+            continue
+        indexed[name] = method
+    return indexed
+
+
+def _classify_dependency_edge(
+    dependency: Dict[str, Any],
+    method_index: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    roles: Set[str] = set()
+    reason_details = dependency.get("reason_details") or []
+    dep_type = (dependency.get("type") or "").lower()
+    call_sites = dependency.get("call_sites") or []
+    lowered_reasons = [reason.lower() for reason in reason_details if isinstance(reason, str)]
+
+    if dep_type == "table":
+        if any(reason.startswith("crud") for reason in lowered_reasons):
+            roles.add("data_write")
+        elif any(reason in {"statement", "form-datasource", "datasource()"} for reason in lowered_reasons):
+            roles.add("data_read")
+        else:
+            if any((occ.get("snippet") or "").lower().startswith("select") for occ in dependency.get("occurrences", []) or []):
+                roles.add("data_read")
+
+    for site in call_sites:
+        context = (site.get("context") or "").lower()
+        if context in {"condition", "return"}:
+            roles.add("control_flow")
+        if context == "assignment":
+            roles.add("calculation")
+        if site.get("ui_related"):
+            roles.add("ui_hook")
+        method = method_index.get(site.get("method"))
+        if not method:
+            continue
+        if method.get("crud_operations"):
+            roles.add("data_write")
+        if method.get("transactions"):
+            roles.add("transactional")
+        if "ui_entry" in (method.get("roles") or []):
+            roles.add("ui_hook")
+
+    if not roles and dependency.get("reason") == "static-call" and call_sites:
+        roles.add("control_flow")
+
+    if "data_write" in roles or "control_flow" in roles or "ui_hook" in roles or "transactional" in roles:
+        impact = "high"
+    elif "data_read" in roles or "calculation" in roles:
+        impact = "medium"
+    else:
+        impact = "low"
+
+    should_traverse = impact != "low"
+    skip_reason = None if should_traverse else "low-impact"
+
+    return {
+        "edge_roles": sorted(roles),
+        "impact": impact,
+        "should_traverse": should_traverse,
+        "skip_reason": skip_reason,
+    }
+
+def _new_method_state(name: str, start_line: int) -> Dict[str, Any]:
+    lowered = name.lower()
+    roles: List[str] = []
+    if lowered in ENTRY_METHOD_NAMES:
+        roles.append("ui_entry")
+    if lowered in CRUD_METHOD_NAMES:
+        roles.append("crud_hook")
+    return {
+        "name": name,
+        "start_line": start_line,
+        "end_line": start_line,
+        "signature": "",
+        "roles": roles,
+        "calls": [],
+        "crud_operations": [],
+        "transactions": [],
+        "field_refs": [],
+    }
+
+
+def _detect_call_context(line: str, call_start: int) -> str:
+    prefix = line[:call_start].strip().lower()
+    tokens = prefix.replace("(", " ").replace(")", " ").split()
+    ordered = list(reversed(tokens))
+    for token in ordered:
+        if token in {"return"}:
+            return "return"
+        if token in {"if", "while", "for", "switch", "case", "catch"}:
+            return "condition"
+        if token in {"else"}:
+            return "condition"
+    if "=" in prefix:
+        return "assignment"
+    return "statement"
+
+
+def _infer_field_context(line: str, span_start: int) -> str:
+    eq_pos = line.find("=")
+    if eq_pos == -1 or span_start > eq_pos:
+        return "read"
+    # treat "==" comparisons as reads
+    next_char = line[eq_pos + 1] if eq_pos + 1 < len(line) else ""
+    if next_char == "=":
+        return "read"
+    return "write"
+
+
 async def _ado_item_exists(path: str, ref: Optional[str]) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """Ping ADO for the item and tell if it exists (without raising)."""
     env = get_env()
@@ -596,44 +715,188 @@ async def get_item_content(path: str, ref: Optional[str]) -> Dict[str, Any]:
 # =========================================
 
 def extract_dependencies(content: str, file_path: Optional[str] = None) -> Dict[str, Any]:
-    deps: List[Dict[str, Any]] = []
-    dep_keys: Set[str] = set()
     filtered_symbols: Dict[str, Dict[str, Any]] = {}
+    dependencies: Dict[str, Dict[str, Any]] = {}
+    methods: List[Dict[str, Any]] = []
+    field_entries: List[Dict[str, Any]] = []
 
-    def _record_symbol(symbol: Optional[str], kind: str, reason: str) -> None:
+    lines = [_strip_xpo_hash(line) for line in content.splitlines()]
+    current_method = _new_method_state("<class>", 1)
+
+    def _record_dependency(
+        symbol: Optional[str],
+        kind: str,
+        reason: str,
+        line_no: Optional[int] = None,
+        method_name: Optional[str] = None,
+        snippet: Optional[str] = None,
+    ) -> None:
         if not symbol:
             return
         trimmed = symbol.strip()
         if not trimmed or trimmed in KERNEL_SKIP or len(trimmed) < 2:
-            filtered_symbols.setdefault(symbol, {"symbol": symbol, "reason": "kernel-filter"})
+            filtered_symbols.setdefault(
+                trimmed or symbol or "<unknown>",
+                {
+                    "symbol": trimmed or symbol,
+                    "reason": "kernel-filter",
+                },
+            )
             return
         folder = TYPE_PATHS.get(kind, "Unknown")
         path = f"{folder}/{trimmed}.xpo"
-        if path in dep_keys:
-            return
-        deps.append({"path": path, "type": kind, "symbol": trimmed, "reason": reason})
-        dep_keys.add(path)
+        entry = dependencies.setdefault(
+            path,
+            {
+                "path": path,
+                "type": kind,
+                "symbol": trimmed,
+                "reasons": set(),
+                "occurrences": [],
+            },
+        )
+        entry["reasons"].add(reason)
+        if line_no is not None:
+            entry["occurrences"].append(
+                {
+                    "line": line_no,
+                    "method": method_name,
+                    "context": reason,
+                    "snippet": snippet[:300] if snippet else None,
+                }
+            )
 
-    for pattern, kind, reason in DEPENDENCY_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE):
-            symbol = match.group(2) if reason == "statement" else match.group(1)
-            _record_symbol(symbol, kind, reason)
+    for line_no, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.strip()
+        method_match = METHOD_DEF_PATTERN.match(stripped)
+        if method_match:
+            current_method["end_line"] = line_no - 1 if line_no > 1 else line_no
+            methods.append(current_method)
+            method_name = method_match.group("name")
+            current_method = _new_method_state(method_name, line_no)
+            current_method["signature"] = stripped
+            continue
+
+        lowered = stripped.lower()
+        if "ttsbegin" in lowered:
+            current_method["transactions"].append({"type": "ttsbegin", "line": line_no})
+        if "ttscommit" in lowered:
+            current_method["transactions"].append({"type": "ttscommit", "line": line_no})
+
+        for crud_match in CRUD_SIGNATURE.finditer(stripped):
+            table = crud_match.group(1)
+            op = crud_match.group(2)
+            current_method["crud_operations"].append({"table": table, "operation": op, "line": line_no})
+            _record_dependency(table, "Table", f"crud-{op.lower()}", line_no, current_method["name"], stripped)
+
+        for table, field in FIELD_REF_PATTERN.findall(stripped):
+            context = _infer_field_context(stripped, stripped.find(f"{table}.{field}"))
+            entry = {
+                "table": table,
+                "field": field,
+                "line": line_no,
+                "context": context,
+                "method": current_method["name"],
+            }
+            current_method["field_refs"].append(entry)
+            field_entries.append(
+                {
+                    "table": table,
+                    "field": field,
+                    "occurrences": [
+                        {
+                            "line": line_no,
+                            "context": context,
+                            "method": current_method["name"],
+                        }
+                    ],
+                }
+            )
+
+        for regex, kind, reason in DEPENDENCY_REGEXES:
+            for match in regex.finditer(stripped):
+                if reason == "statement":
+                    symbol = match.group(2)
+                else:
+                    symbol = match.group(1)
+                _record_dependency(symbol, kind, reason, line_no, current_method["name"], stripped)
+
+        for call_match in CALL_PATTERN.finditer(stripped):
+            expression = call_match.group(1)
+            base_symbol: Optional[str] = None
+            call_type = "instance"
+            if "::" in expression:
+                base_symbol = expression.split("::", 1)[0]
+                call_type = "static"
+            elif "." in expression:
+                base_symbol = expression.split(".", 1)[0]
+            else:
+                base_symbol = expression
+            norm_symbol = base_symbol.strip() if base_symbol else None
+            if norm_symbol and norm_symbol.lower() in CALL_KEYWORDS:
+                norm_symbol = None
+            context = _detect_call_context(stripped, call_match.start())
+            ui_related = bool(norm_symbol and (norm_symbol.lower().endswith("_ds") or norm_symbol.lower() == "element"))
+            call_info = {
+                "expression": expression,
+                "line": line_no,
+                "context": context,
+                "symbol": norm_symbol,
+                "call_type": call_type,
+                "ui_related": ui_related or ("element." in expression.lower()),
+            }
+            current_method["calls"].append(call_info)
+
+    current_method["end_line"] = len(lines)
+    methods.append(current_method)
 
     if _looks_like_form_path(file_path or ""):
-        for pattern in FORM_DS_PATTERNS:
-            for form_match in re.finditer(pattern, content, re.IGNORECASE):
-                _record_symbol(form_match.group(1), "Table", "form-datasource")
+        for regex in FORM_DS_REGEXES:
+            for match in regex.finditer(content):
+                _record_dependency(match.group(1), "Table", "form-datasource", None, None, None)
+
+    dependencies_list: List[Dict[str, Any]] = []
+    for entry in dependencies.values():
+        reasons = sorted(entry.pop("reasons"))
+        entry["reason"] = reasons[0] if reasons else None
+        entry["reason_details"] = reasons
+        if entry.get("occurrences"):
+            entry["occurrences"] = sorted(entry["occurrences"], key=lambda item: item.get("line") or 0)
+        dependencies_list.append(entry)
+
+    symbol_map = {dep.get("symbol", "").lower(): dep for dep in dependencies_list}
+    for method in methods:
+        for call in method.get("calls", []):
+            symbol = (call.get("symbol") or "").lower()
+            if not symbol:
+                continue
+            dep = symbol_map.get(symbol)
+            if not dep:
+                continue
+            call_sites = dep.setdefault("call_sites", [])
+            call_sites.append(
+                {
+                    "method": method["name"],
+                    "line": call["line"],
+                    "context": call["context"],
+                    "expression": call["expression"],
+                    "ui_related": call["ui_related"],
+                }
+            )
 
     filtered_list = list(filtered_symbols.values())
     log.info(
-        "[extract] file=%s deps=%d filtered=%d",
+        "[extract] file=%s deps=%d filtered=%d methods=%d",
         file_path or "<mem>",
-        len(deps),
+        len(dependencies_list),
         len(filtered_list),
+        len(methods),
     )
     return {
-        "dependencies": deps,
+        "dependencies": dependencies_list,
         "filtered_dependencies": filtered_list,
+        "methods": methods,
+        "field_usage": _summarize_field_usage(field_entries),
     }
 # =========================================
 # CLASSIFICATION + RETRY
@@ -736,6 +999,8 @@ async def deps_get(
         "sha": sha,
         "dependencies": paged,
         "filtered_dependencies": parsed["filtered_dependencies"],
+        "methods": parsed.get("methods", []),
+        "field_usage": parsed.get("field_usage", []),
         "page": page,
         "limit": limit,
         "total_dependencies": total,
@@ -783,6 +1048,8 @@ async def _analyze_single_file(path: str, ref: Optional[str], return_content: bo
         "content_len": len(file_res.get("content", "")),
         "dependencies": norm_deps,
         "filtered_dependencies": deps_res.get("filtered_dependencies", []),
+        "methods": deps_res.get("methods", []),
+        "field_usage": deps_res.get("field_usage", []),
         "error": None,
     }
     if return_content and file_content is not None:
@@ -802,6 +1069,7 @@ async def _collect_branch(
     max_concurrency: int,
     include_sources: bool = False,
     source_budget: Optional[int] = None,
+    fanout_limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     sem = Semaphore(max_concurrency)
     analysis_cache: Dict[str, Dict[str, Any]] = {}
@@ -831,8 +1099,22 @@ async def _collect_branch(
         analysis_cache[path] = analysis
         return analysis
 
+    graph: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    seen_edges: Set[Tuple[str, str, Optional[str]]] = set()
+
     frontier: List[str] = [start_file]
     depth = 0
+    if fanout_limit is None:
+        fanout_cap: Optional[int] = DEFAULT_MAX_FANOUT
+    elif fanout_limit <= 0:
+        fanout_cap = None
+    else:
+        fanout_cap = fanout_limit
+
+    def _edge_priority(entry: Dict[str, Any]) -> Tuple[int, str]:
+        rank = {"high": 0, "medium": 1, "low": 2}.get(entry.get("impact"), 2)
+        return (rank, entry.get("symbol") or entry.get("path") or "")
 
     while frontier and depth <= max_depth and len(visit_order) < max_files:
         level: List[str] = []
@@ -854,16 +1136,89 @@ async def _collect_branch(
         for path, analysis in zip(level, analyses):
             if analysis.get("error"):
                 continue
-            if depth >= max_depth:
-                continue
-            for dep in analysis.get("dependencies", []) or []:
+
+            depth_idx = depths.get(path, -1)
+            deps = analysis.get("dependencies", []) or []
+            filtered_local = analysis.get("filtered_dependencies", []) or []
+            filtered_all.extend(filtered_local)
+            method_index = _index_methods(analysis.get("methods"))
+
+            classified_deps: List[Dict[str, Any]] = []
+            for dep in deps:
                 dep_path = dep.get("path")
-                if not dep_path or dep_path in depths or dep_path in next_frontier:
+                if not dep_path:
                     continue
-                if len(visit_order) + len(next_frontier) < max_files:
-                    next_frontier.append(dep_path)
-                else:
-                    overflow.append(dep_path)
+                enriched = dict(dep)
+                enriched.update(_classify_dependency_edge(dep, method_index))
+                enriched["from"] = path
+                enriched["depth_from_root"] = depth_idx + 1
+                classified_deps.append(enriched)
+
+                symbol = dep.get("symbol")
+                category = _symbol_category(symbol)
+                if category in dependency_catalog:
+                    key = symbol or dep_path
+                    dependency_catalog[category][key] = {
+                        "symbol": symbol,
+                        "type": dep.get("type"),
+                        "path": dep_path,
+                        "reason": dep.get("reason"),
+                        "impact": enriched.get("impact"),
+                        "roles": enriched.get("edge_roles"),
+                    }
+
+            classified_deps.sort(key=_edge_priority)
+
+            fanout_used = 0
+            for dep in classified_deps:
+                if depth >= max_depth:
+                    dep["skip_reason"] = dep.get("skip_reason") or "depth-limit"
+                    continue
+                target = dep.get("path")
+                if not target or target in depths or target in next_frontier:
+                    continue
+                if not dep.get("should_traverse"):
+                    continue
+                if fanout_cap is not None and fanout_used >= fanout_cap:
+                    dep["skip_reason"] = dep.get("skip_reason") or "fanout-limit"
+                    continue
+                if len(visit_order) + len(next_frontier) >= max_files:
+                    overflow.append(target)
+                    dep["skip_reason"] = dep.get("skip_reason") or "file-limit"
+                    continue
+                next_frontier.append(target)
+                fanout_used += 1
+
+            graph.append(
+                {
+                    "file": path,
+                    "depth": depth_idx,
+                    "dependencies": [dep.get("path") for dep in classified_deps if dep.get("path")],
+                    "dependency_details": classified_deps,
+                }
+            )
+
+            for dep in classified_deps:
+                dep_path = dep.get("path")
+                if not dep_path:
+                    continue
+                edge_key = (path, dep_path, dep.get("reason"))
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                edges.append(
+                    {
+                        "from": path,
+                        "to": dep_path,
+                        "reason": dep.get("reason"),
+                        "type": dep.get("type"),
+                        "depth_from_root": dep.get("depth_from_root"),
+                        "impact": dep.get("impact"),
+                        "roles": dep.get("edge_roles"),
+                        "should_traverse": dep.get("should_traverse"),
+                        "skip_reason": dep.get("skip_reason"),
+                    }
+                )
 
         frontier = next_frontier
         depth += 1
@@ -871,49 +1226,6 @@ async def _collect_branch(
     depth_completed = max(depths.values()) if depths else 0
     limit_reached = len(visit_order) >= max_files
     more_available = bool(frontier) or bool(overflow)
-
-    graph: List[Dict[str, Any]] = []
-    edges: List[Dict[str, Any]] = []
-    seen_edges: Set[Tuple[str, str, Optional[str]]] = set()
-
-    for path in visit_order:
-        analysis = await _analyze_guarded(path, include_sources)
-        depth_idx = depths.get(path, -1)
-        deps = analysis.get("dependencies", []) or []
-        filtered_local = analysis.get("filtered_dependencies", []) or []
-        filtered_all.extend(filtered_local)
-
-        dep_paths: List[str] = []
-        for dep in deps:
-            dep_path = dep.get("path")
-            if not dep_path:
-                continue
-            dep_paths.append(dep_path)
-            symbol = dep.get("symbol")
-            category = _symbol_category(symbol)
-            if category in dependency_catalog:
-                key = symbol or dep_path
-                dependency_catalog[category][key] = {
-                    "symbol": symbol,
-                    "type": dep.get("type"),
-                    "path": dep_path,
-                    "reason": dep.get("reason"),
-                }
-            edge_key = (path, dep_path, dep.get("reason"))
-            if edge_key in seen_edges:
-                continue
-            seen_edges.add(edge_key)
-            edges.append(
-                {
-                    "from": path,
-                    "to": dep_path,
-                    "reason": dep.get("reason"),
-                    "type": dep.get("type"),
-                    "depth_from_root": depth_idx + 1,
-                }
-            )
-
-        graph.append({"file": path, "depth": depth_idx, "dependencies": dep_paths})
 
     pending = sorted(set(frontier + overflow))
     status = "complete" if not more_available else "partial"
@@ -969,6 +1281,7 @@ async def _collect_branch(
         "pending": pending,
         "graph": graph,
         "edges": edges,
+        "fanout_limit": fanout_cap,
         "status": status,
         "dependency_summary": dependency_summary,
         "sources": sources,
@@ -1050,6 +1363,8 @@ async def report_dependencies(payload: Dict[str, Any] = Body(...)) -> Dict[str, 
         "direct_dependencies": direct,
         "dependency_summary": dependency_summary,
         "filtered_dependencies": analysis.get("filtered_dependencies", []),
+        "methods": analysis.get("methods", []),
+        "field_usage": analysis.get("field_usage", []),
     }
     response["approx_bytes"] = _approx_size(response)
     log.info(
@@ -1093,6 +1408,14 @@ async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     except Exception:
         max_bytes = DEFAULT_MAX_BYTES
 
+    fanout_limit: Optional[int] = None
+    if "fanout_limit" in payload:
+        raw_fanout = payload.get("fanout_limit")
+        try:
+            fanout_limit = int(raw_fanout)
+        except Exception:
+            fanout_limit = DEFAULT_MAX_FANOUT
+
     include_source = bool(payload.get("include_source", False))
     source_limit: Optional[int] = None
     if include_source:
@@ -1112,6 +1435,7 @@ async def report_branch(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         max_concurrency=max_concurrency,
         include_sources=include_source,
         source_budget=source_limit,
+        fanout_limit=fanout_limit,
     )
 
     branch["max_depth"] = max_depth

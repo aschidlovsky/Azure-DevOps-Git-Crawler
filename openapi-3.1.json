@@ -19,12 +19,7 @@
             "description": "Service is up",
             "content": {
               "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "status": { "type": "string", "example": "ok" }
-                  }
-                }
+                "schema": { "type": "object", "properties": { "status": { "type": "string", "example": "ok" } } }
               }
             }
           }
@@ -36,29 +31,11 @@
         "summary": "Fetch a file from the repo",
         "operationId": "getFile",
         "parameters": [
-          {
-            "in": "query",
-            "name": "path",
-            "required": true,
-            "schema": { "type": "string" },
-            "description": "Repo path (e.g., Forms/CustTable.xpo)"
-          },
-          {
-            "in": "query",
-            "name": "ref",
-            "schema": { "type": "string" },
-            "description": "Branch or tag; defaults to DEFAULT_REF"
-          }
+          { "in": "query", "name": "path", "required": true, "schema": { "type": "string" }, "description": "Repo path (e.g., Forms/CustTable.xpo)" },
+          { "in": "query", "name": "ref", "schema": { "type": "string" }, "description": "Branch or tag; defaults to DEFAULT_REF" }
         ],
         "responses": {
-          "200": {
-            "description": "File returned",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/FileResponse" }
-              }
-            }
-          },
+          "200": { "description": "File returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FileResponse" } } } },
           "404": { "description": "File not found" }
         }
       }
@@ -68,31 +45,13 @@
         "summary": "List direct dependencies for a file",
         "operationId": "getDeps",
         "parameters": [
-          {
-            "in": "query",
-            "name": "file",
-            "required": true,
-            "schema": { "type": "string" },
-            "description": "Repo path to .xpo"
-          },
-          {
-            "in": "query",
-            "name": "ref",
-            "schema": { "type": "string" },
-            "description": "Branch or tag"
-          },
+          { "in": "query", "name": "file", "required": true, "schema": { "type": "string" }, "description": "Repo path to .xpo" },
+          { "in": "query", "name": "ref", "schema": { "type": "string" }, "description": "Branch or tag" },
           { "in": "query", "name": "page", "schema": { "type": "integer", "default": 1 } },
           { "in": "query", "name": "limit", "schema": { "type": "integer", "default": 200 } }
         ],
         "responses": {
-          "200": {
-            "description": "Dependencies returned",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/DepsPageResponse" }
-              }
-            }
-          }
+          "200": { "description": "Dependencies returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DepsPageResponse" } } } }
         }
       }
     },
@@ -117,14 +76,7 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "File returned",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/FirstHopResponse" }
-              }
-            }
-          }
+          "200": { "description": "File returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FirstHopResponse" } } } }
         }
       }
     },
@@ -148,14 +100,7 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Dependencies returned",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/DependenciesResponse" }
-              }
-            }
-          }
+          "200": { "description": "Dependencies returned", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DependenciesResponse" } } } }
         }
       }
     },
@@ -177,7 +122,8 @@
                   "max_files": { "type": "integer", "default": 80 },
                   "max_concurrency": { "type": "integer", "default": 6 },
                   "max_bytes": { "type": "integer", "default": 350000 },
-                  "include_source": { "type": "boolean", "description": "Include file bodies during traversal" },
+                  "fanout_limit": { "type": "integer", "description": "Max behavior-impacting dependencies to expand per node (<=0 disables limit)" },
+                  "include_source": { "type": "boolean", "description": "If true, include file bodies for visited nodes" },
                   "include_source_limit": { "type": "integer", "description": "Total bytes available for included sources" }
                 }
               }
@@ -185,14 +131,7 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Branch traversal",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/BranchResponse" }
-              }
-            }
-          }
+          "200": { "description": "Branch traversal", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BranchResponse" } } } }
         }
       }
     }
@@ -208,13 +147,99 @@
           "content": { "type": "string" }
         }
       },
+      "DependencyOccurrence": {
+        "type": "object",
+        "properties": {
+          "line": { "type": "integer" },
+          "method": { "type": "string" },
+          "context": { "type": "string" },
+          "snippet": { "type": "string" }
+        }
+      },
+      "CallSite": {
+        "type": "object",
+        "properties": {
+          "method": { "type": "string" },
+          "line": { "type": "integer" },
+          "context": { "type": "string" },
+          "expression": { "type": "string" },
+          "ui_related": { "type": "boolean" }
+        }
+      },
+      "MethodCall": {
+        "type": "object",
+        "properties": {
+          "expression": { "type": "string" },
+          "line": { "type": "integer" },
+          "context": { "type": "string" },
+          "symbol": { "type": "string", "nullable": true },
+          "call_type": { "type": "string" },
+          "ui_related": { "type": "boolean" }
+        }
+      },
+      "CrudOperation": {
+        "type": "object",
+        "properties": {
+          "table": { "type": "string" },
+          "operation": { "type": "string" },
+          "line": { "type": "integer" }
+        }
+      },
+      "TransactionMarker": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string" },
+          "line": { "type": "integer" }
+        }
+      },
+      "FieldReference": {
+        "type": "object",
+        "properties": {
+          "table": { "type": "string" },
+          "field": { "type": "string" },
+          "line": { "type": "integer" },
+          "context": { "type": "string" },
+          "method": { "type": "string" }
+        }
+      },
+      "FieldUsageField": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "occurrences": { "type": "array", "items": { "$ref": "#/components/schemas/DependencyOccurrence" } }
+        }
+      },
+      "FieldUsageEntry": {
+        "type": "object",
+        "properties": {
+          "table": { "type": "string" },
+          "fields": { "type": "array", "items": { "$ref": "#/components/schemas/FieldUsageField" } }
+        }
+      },
+      "MethodSummary": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "start_line": { "type": "integer" },
+          "end_line": { "type": "integer" },
+          "signature": { "type": "string" },
+          "roles": { "type": "array", "items": { "type": "string" } },
+          "calls": { "type": "array", "items": { "$ref": "#/components/schemas/MethodCall" } },
+          "crud_operations": { "type": "array", "items": { "$ref": "#/components/schemas/CrudOperation" } },
+          "transactions": { "type": "array", "items": { "$ref": "#/components/schemas/TransactionMarker" } },
+          "field_refs": { "type": "array", "items": { "$ref": "#/components/schemas/FieldReference" } }
+        }
+      },
       "Dependency": {
         "type": "object",
         "properties": {
           "path": { "type": "string" },
           "type": { "type": "string" },
           "symbol": { "type": "string" },
-          "reason": { "type": "string" }
+          "reason": { "type": "string" },
+          "reason_details": { "type": "array", "items": { "type": "string" } },
+          "occurrences": { "type": "array", "items": { "$ref": "#/components/schemas/DependencyOccurrence" } },
+          "call_sites": { "type": "array", "items": { "$ref": "#/components/schemas/CallSite" } }
         }
       },
       "FilteredDependency": {
@@ -230,7 +255,9 @@
           "symbol": { "type": "string" },
           "type": { "type": "string" },
           "path": { "type": "string" },
-          "reason": { "type": "string" }
+          "reason": { "type": "string" },
+          "impact": { "type": "string" },
+          "roles": { "type": "array", "items": { "type": "string" } }
         }
       },
       "DependencySummary": {
@@ -249,6 +276,8 @@
           "sha": { "type": "string" },
           "dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/Dependency" } },
           "filtered_dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/FilteredDependency" } },
+          "methods": { "type": "array", "items": { "$ref": "#/components/schemas/MethodSummary" } },
+          "field_usage": { "type": "array", "items": { "$ref": "#/components/schemas/FieldUsageEntry" } },
           "page": { "type": "integer" },
           "limit": { "type": "integer" },
           "total_dependencies": { "type": "integer" },
@@ -280,6 +309,8 @@
           "direct_dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/Dependency" } },
           "filtered_dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/FilteredDependency" } },
           "dependency_summary": { "$ref": "#/components/schemas/DependencySummary" },
+          "methods": { "type": "array", "items": { "$ref": "#/components/schemas/MethodSummary" } },
+          "field_usage": { "type": "array", "items": { "$ref": "#/components/schemas/FieldUsageEntry" } },
           "approx_bytes": { "type": "integer" }
         }
       },
@@ -288,7 +319,8 @@
         "properties": {
           "file": { "type": "string" },
           "depth": { "type": "integer" },
-          "dependencies": { "type": "array", "items": { "type": "string" } }
+          "dependencies": { "type": "array", "items": { "type": "string" } },
+          "dependency_details": { "type": "array", "items": { "$ref": "#/components/schemas/GraphDependencyDetail" } }
         }
       },
       "GraphEdge": {
@@ -298,7 +330,27 @@
           "to": { "type": "string" },
           "reason": { "type": "string" },
           "type": { "type": "string" },
-          "depth_from_root": { "type": "integer" }
+          "depth_from_root": { "type": "integer" },
+          "impact": { "type": "string" },
+          "roles": { "type": "array", "items": { "type": "string" } },
+          "should_traverse": { "type": "boolean" },
+          "skip_reason": { "type": "string", "nullable": true }
+        }
+      },
+      "GraphDependencyDetail": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "type": { "type": "string" },
+          "symbol": { "type": "string" },
+          "reason": { "type": "string" },
+          "reason_details": { "type": "array", "items": { "type": "string" } },
+          "call_sites": { "type": "array", "items": { "$ref": "#/components/schemas/CallSite" } },
+          "occurrences": { "type": "array", "items": { "$ref": "#/components/schemas/DependencyOccurrence" } },
+          "impact": { "type": "string" },
+          "edge_roles": { "type": "array", "items": { "type": "string" } },
+          "should_traverse": { "type": "boolean" },
+          "skip_reason": { "type": "string", "nullable": true }
         }
       },
       "BranchResponse": {
@@ -320,6 +372,7 @@
           "max_files": { "type": "integer" },
           "max_concurrency": { "type": "integer" },
           "max_bytes": { "type": "integer" },
+          "fanout_limit": { "type": "integer", "nullable": true },
           "include_source_limit": { "type": "integer", "nullable": true },
           "truncated": { "type": "boolean" },
           "approx_bytes": { "type": "integer" }
