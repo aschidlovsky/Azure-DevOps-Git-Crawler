@@ -696,6 +696,8 @@ async def health() -> Dict[str, str]:
 
 @app.get("/file")
 @app.get("/file/")
+@app.get("//file")
+@app.get("//file/")
 async def file_get(
     path: str = Query(..., description="Repo path (e.g., Forms/CustTable.xpo)"),
     ref: Optional[str] = Query(None),
@@ -711,6 +713,8 @@ async def file_get(
 
 @app.get("/deps")
 @app.get("/deps/")
+@app.get("//deps")
+@app.get("//deps/")
 async def deps_get(
     file: str = Query(..., description="Repo path to .xpo file"),
     ref: Optional[str] = Query(None),
