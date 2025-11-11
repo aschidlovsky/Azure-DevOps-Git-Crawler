@@ -1,0 +1,340 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "ADO Repo Dependency Connector",
+    "version": "1.4.0",
+    "description": "API for exploring Dynamics AX / D365 X++ source files and dependency graphs."
+  },
+  "servers": [
+    { "url": "https://azure-devops-git-crawler-production.up.railway.app/", "description": "Production" },
+    { "url": "http://localhost:8080", "description": "Local development" }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health Check",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "Service is up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "ok" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/file": {
+      "get": {
+        "summary": "Fetch a file from the repo",
+        "operationId": "getFile",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Repo path (e.g., Forms/CustTable.xpo)"
+          },
+          {
+            "in": "query",
+            "name": "ref",
+            "schema": { "type": "string" },
+            "description": "Branch or tag; defaults to DEFAULT_REF"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File returned",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FileResponse" }
+              }
+            }
+          },
+          "404": { "description": "File not found" }
+        }
+      }
+    },
+    "/deps": {
+      "get": {
+        "summary": "List direct dependencies for a file",
+        "operationId": "getDeps",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "file",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Repo path to .xpo"
+          },
+          {
+            "in": "query",
+            "name": "ref",
+            "schema": { "type": "string" },
+            "description": "Branch or tag"
+          },
+          { "in": "query", "name": "page", "schema": { "type": "integer", "default": 1 } },
+          { "in": "query", "name": "limit", "schema": { "type": "integer", "default": 200 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dependencies returned",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DepsPageResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/report.firsthop": {
+      "post": {
+        "summary": "Return file metadata + raw content",
+        "operationId": "postReportFirstHop",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["start_file"],
+                "properties": {
+                  "start_file": { "type": "string", "description": "Entry file to analyze" },
+                  "ref": { "type": "string", "description": "Branch or tag; defaults to DEFAULT_REF" },
+                  "include_source": { "type": "boolean", "description": "Include file content (defaults to true)" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "File returned",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FirstHopResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/report.dependencies": {
+      "post": {
+        "summary": "Return direct dependency list",
+        "operationId": "postReportDependencies",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["start_file"],
+                "properties": {
+                  "start_file": { "type": "string" },
+                  "ref": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dependencies returned",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DependenciesResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/report.branch": {
+      "post": {
+        "summary": "Traverse a dependency branch",
+        "operationId": "postReportBranch",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["start_file"],
+                "properties": {
+                  "start_file": { "type": "string" },
+                  "ref": { "type": "string" },
+                  "max_depth": { "type": "integer", "default": 5 },
+                  "max_files": { "type": "integer", "default": 80 },
+                  "max_concurrency": { "type": "integer", "default": 6 },
+                  "max_bytes": { "type": "integer", "default": 350000 },
+                  "include_source": { "type": "boolean", "description": "Include file bodies during traversal" },
+                  "include_source_limit": { "type": "integer", "description": "Total bytes available for included sources" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Branch traversal",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BranchResponse" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "FileResponse": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "content": { "type": "string" }
+        }
+      },
+      "Dependency": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "type": { "type": "string" },
+          "symbol": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      },
+      "FilteredDependency": {
+        "type": "object",
+        "properties": {
+          "symbol": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      },
+      "DependencySummaryItem": {
+        "type": "object",
+        "properties": {
+          "symbol": { "type": "string" },
+          "type": { "type": "string" },
+          "path": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      },
+      "DependencySummary": {
+        "type": "object",
+        "properties": {
+          "custom": { "type": "array", "items": { "$ref": "#/components/schemas/DependencySummaryItem" } },
+          "standard": { "type": "array", "items": { "$ref": "#/components/schemas/DependencySummaryItem" } },
+          "filtered": { "type": "array", "items": { "$ref": "#/components/schemas/FilteredDependency" } }
+        }
+      },
+      "DepsPageResponse": {
+        "type": "object",
+        "properties": {
+          "file": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/Dependency" } },
+          "filtered_dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/FilteredDependency" } },
+          "page": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "total_dependencies": { "type": "integer" },
+          "total_pages": { "type": "integer" }
+        }
+      },
+      "FirstHopResponse": {
+        "type": "object",
+        "properties": {
+          "root": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "content_len": { "type": "integer" },
+          "status": { "type": "string" },
+          "error": { "type": "string", "nullable": true },
+          "source": { "$ref": "#/components/schemas/FileSource" },
+          "approx_bytes": { "type": "integer" }
+        }
+      },
+      "DependenciesResponse": {
+        "type": "object",
+        "properties": {
+          "root": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "status": { "type": "string" },
+          "error": { "type": "string", "nullable": true },
+          "total_dependencies": { "type": "integer" },
+          "direct_dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/Dependency" } },
+          "filtered_dependencies": { "type": "array", "items": { "$ref": "#/components/schemas/FilteredDependency" } },
+          "dependency_summary": { "$ref": "#/components/schemas/DependencySummary" },
+          "approx_bytes": { "type": "integer" }
+        }
+      },
+      "GraphNode": {
+        "type": "object",
+        "properties": {
+          "file": { "type": "string" },
+          "depth": { "type": "integer" },
+          "dependencies": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "GraphEdge": {
+        "type": "object",
+        "properties": {
+          "from": { "type": "string" },
+          "to": { "type": "string" },
+          "reason": { "type": "string" },
+          "type": { "type": "string" },
+          "depth_from_root": { "type": "integer" }
+        }
+      },
+      "BranchResponse": {
+        "type": "object",
+        "properties": {
+          "root": { "type": "string" },
+          "ref": { "type": "string" },
+          "max_depth": { "type": "integer" },
+          "depth_completed": { "type": "integer" },
+          "visited": { "type": "array", "items": { "type": "string" } },
+          "visited_count": { "type": "integer" },
+          "limit_reached": { "type": "boolean" },
+          "pending": { "type": "array", "items": { "type": "string" } },
+          "graph": { "type": "array", "items": { "$ref": "#/components/schemas/GraphNode" } },
+          "edges": { "type": "array", "items": { "$ref": "#/components/schemas/GraphEdge" } },
+          "status": { "type": "string" },
+          "dependency_summary": { "$ref": "#/components/schemas/DependencySummary" },
+          "sources": { "type": "array", "items": { "$ref": "#/components/schemas/FileSource" } },
+          "max_files": { "type": "integer" },
+          "max_concurrency": { "type": "integer" },
+          "max_bytes": { "type": "integer" },
+          "include_source_limit": { "type": "integer", "nullable": true },
+          "truncated": { "type": "boolean" },
+          "approx_bytes": { "type": "integer" }
+        }
+      },
+      "FileSource": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "ref": { "type": "string" },
+          "sha": { "type": "string" },
+          "bytes": { "type": "integer" },
+          "content": { "type": "string" }
+        }
+      }
+    }
+  }
+}
